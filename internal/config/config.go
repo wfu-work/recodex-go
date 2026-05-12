@@ -1,10 +1,12 @@
 package config
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -121,5 +123,93 @@ func normalize(cfg *Config) error {
 			cfg.Workspaces[i].Name = filepath.Base(abs)
 		}
 	}
+
+	discovered, err := discoverCodexWorkspaces()
+	if err != nil {
+		return err
+	}
+	cfg.Workspaces = mergeWorkspaces(cfg.Workspaces, discovered)
 	return nil
+}
+
+func discoverCodexWorkspaces() ([]WorkspaceConfig, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil
+	}
+	return readCodexProjects(filepath.Join(home, ".codex", "config.toml"))
+}
+
+func readCodexProjects(path string) ([]WorkspaceConfig, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var items []WorkspaceConfig
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		projectPath, ok := parseProjectHeader(line)
+		if !ok {
+			continue
+		}
+		if info, err := os.Stat(projectPath); err != nil || !info.IsDir() {
+			continue
+		}
+		items = append(items, WorkspaceConfig{
+			Name: filepath.Base(projectPath),
+			Path: filepath.Clean(projectPath),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func parseProjectHeader(line string) (string, bool) {
+	const prefix = `[projects."`
+	const suffix = `"]`
+	if !strings.HasPrefix(line, prefix) || !strings.HasSuffix(line, suffix) {
+		return "", false
+	}
+	path := strings.TrimSuffix(strings.TrimPrefix(line, prefix), suffix)
+	if path == "" {
+		return "", false
+	}
+	return filepath.Clean(path), true
+}
+
+func mergeWorkspaces(manual, discovered []WorkspaceConfig) []WorkspaceConfig {
+	result := make([]WorkspaceConfig, 0, len(manual)+len(discovered))
+	seen := map[string]struct{}{}
+
+	add := func(item WorkspaceConfig) {
+		path := filepath.Clean(item.Path)
+		if path == "" || path == "." {
+			return
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		if item.Name == "" {
+			item.Name = filepath.Base(path)
+		}
+		item.Path = path
+		seen[path] = struct{}{}
+		result = append(result, item)
+	}
+
+	for _, item := range manual {
+		add(item)
+	}
+	for _, item := range discovered {
+		add(item)
+	}
+	return result
 }

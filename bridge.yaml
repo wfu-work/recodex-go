@@ -9,12 +9,6 @@ codex:
 state:
   dir: ".recodex"
 
-workspaces:
-  - name: "recodex-app"
-    path: "/Users/wfu/Documents/works/xiaoxi/code/recodex/recodex-app"
-  - name: "recodex-go"
-    path: "/Users/wfu/Documents/works/xiaoxi/code/recodex/recodex-go"
-
 security:
   pairing_enabled: true
   pairing_ttl_seconds: 300

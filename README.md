@@ -10,7 +10,7 @@ Recodex Bridge 是 Remote Codex Companion 的 Go 端桥接服务。它运行在�
 - WebSocket JSON 信封协议。
 - 短期配对 Token 和长期设备 Key。
 - 已配对设备列表与撤销。
-- 工作区白名单限制。
+- 自动读取 Codex 已记录的项目作为工作区。
 - 通过 `codex exec --json` 启动 Codex 会话并流式返回事件。
 - 会话索引持久化。
 - Git 状态、Diff、日志、提交和推送封装。
@@ -31,7 +31,7 @@ internal/
   gitops/       Git 命令封装
   relay/        Relay 房间和连接管理
   session/      Codex 会话管理与持久化
-  workspace/    工作区白名单解析
+  workspace/    工作区解析
 docs/
   protocol.md   通信协议说明
   security.md   安全设计说明
@@ -81,7 +81,9 @@ http://127.0.0.1:8765
 
 ## 配置
 
-配置文件为 `bridge.yaml`，可以调整监听地址、Codex 二进制路径、状态目录、工作区白名单和安全选项。
+配置文件为 `bridge.yaml`，可以调整监听地址、Codex 二进制路径、状态目录和安全选项。
+
+工作区默认会从 `~/.codex/config.toml` 的 `[projects."路径"]` 自动读取，只加入本机真实存在的目录。通常不需要在 `bridge.yaml` 里维护项目路径。
 
 示例：
 
@@ -97,14 +99,18 @@ codex:
 state:
   dir: ".recodex"
 
-workspaces:
-  - name: "recodex-go"
-    path: "/path/to/recodex-go"
-
 security:
   pairing_enabled: true
   pairing_ttl_seconds: 300
   require_confirm_for_git_write: true
+```
+
+如果需要补充 Codex 未记录的目录，也可以手动添加 `workspaces`：
+
+```yaml
+workspaces:
+  - name: "my-project"
+    path: "/path/to/my-project"
 ```
 
 如果要让局域网内其他设备连接，把 `server.host` 改为 `0.0.0.0`：
@@ -177,7 +183,7 @@ Relay 接口：
 ## 安全约束
 
 - Bridge 默认只监听 `127.0.0.1`。
-- 工作区访问受 `bridge.yaml` 白名单限制。
+- 工作区默认来自 Codex 已记录项目，也可以通过 `bridge.yaml` 追加。
 - 配对 Token 短期有效。
 - 已配对设备的长期 Key 保存在状态目录中。
 - 已认证客户端可以列出和撤销设备。

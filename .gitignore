@@ -25,5 +25,8 @@ go.work.sum
 # env file
 .env
 .recodex/
+.cache/
+bin/
+.DS_Store
 .vscode
 .idea
