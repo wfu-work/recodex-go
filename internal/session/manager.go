@@ -323,7 +323,7 @@ func readCodexHistorySummary(path string) (codexHistorySession, error) {
 			}
 			var payload codexHistoryEventPayload
 			if err := json.Unmarshal(line.Payload, &payload); err == nil && payload.Type == "user_message" {
-				item.Prompt = payload.Message
+				item.Prompt = cleanUserPrompt(payload.Message)
 			}
 		}
 	}
@@ -364,11 +364,19 @@ func readCodexHistoryEvents(path, sessionID string) ([]codex.Event, error) {
 		events = append(events, codex.Event{
 			SessionID: codexHistoryIDPrefix + sessionID,
 			Kind:      kind,
-			Text:      payload.Message,
+			Text:      cleanUserPrompt(payload.Message),
 			Time:      parseCodexTime(line.Timestamp),
 		})
 	}
 	return events, scanner.Err()
+}
+
+func cleanUserPrompt(value string) string {
+	const marker = "## My request for Codex:"
+	if idx := strings.Index(value, marker); idx >= 0 {
+		return strings.TrimSpace(value[idx+len(marker):])
+	}
+	return strings.TrimSpace(value)
 }
 
 func parseCodexTime(value string) time.Time {

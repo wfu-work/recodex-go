@@ -215,6 +215,8 @@ func (c *wsClient) handle(ctx context.Context, env Envelope) {
 		c.handleGitCommit(ctx, env)
 	case "git.push":
 		c.handleGitPush(ctx, env)
+	case "git.undo":
+		c.handleGitUndo(ctx, env)
 	default:
 		_ = c.writeError(env.ID, "unknown_type", "unsupported message type: "+env.Type)
 	}
@@ -442,6 +444,29 @@ func (c *wsClient) handleGitPush(ctx context.Context, env Envelope) {
 		return
 	}
 	_ = c.write("git.push.result", env.ID, map[string]any{"output": output})
+}
+
+func (c *wsClient) handleGitUndo(ctx context.Context, env Envelope) {
+	var payload gitWritePayload
+	if err := decode(env.Payload, &payload); err != nil {
+		_ = c.writeError(env.ID, "bad_payload", err.Error())
+		return
+	}
+	if c.server.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
+		_ = c.write("confirm.required", env.ID, map[string]any{"action": "git.undo", "message": "Undo changes requires confirmation."})
+		return
+	}
+	ws, err := c.server.workspaces.Resolve(payload.Workspace)
+	if err != nil {
+		_ = c.writeError(env.ID, "workspace_denied", err.Error())
+		return
+	}
+	output, err := gitops.Undo(ctx, ws.Path)
+	if err != nil {
+		_ = c.writeError(env.ID, "git_undo_failed", err.Error()+"\n"+output)
+		return
+	}
+	_ = c.write("git.undo.result", env.ID, map[string]any{"output": output})
 }
 
 func (c *wsClient) write(msgType, id string, payload any) error {
