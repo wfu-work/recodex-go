@@ -170,6 +170,8 @@ func (c *wsClient) handle(ctx context.Context, env Envelope) {
 		_ = c.write("workspace.list.result", env.ID, map[string]any{"workspaces": c.server.workspaces.List()})
 	case "session.list":
 		_ = c.write("session.list.result", env.ID, map[string]any{"sessions": c.server.sessions.List()})
+	case "session.events":
+		c.handleSessionEvents(env)
 	case "device.list":
 		_ = c.write("device.list.result", env.ID, map[string]any{"devices": c.server.devices.Devices()})
 	case "device.revoke":
@@ -285,6 +287,27 @@ func (c *wsClient) handleSessionStart(ctx context.Context, env Envelope) {
 
 type interruptPayload struct {
 	SessionID string `json:"sessionId"`
+}
+
+type sessionEventsPayload struct {
+	SessionID string `json:"sessionId"`
+}
+
+func (c *wsClient) handleSessionEvents(env Envelope) {
+	var payload sessionEventsPayload
+	if err := decode(env.Payload, &payload); err != nil {
+		_ = c.writeError(env.ID, "bad_payload", err.Error())
+		return
+	}
+	events, err := c.server.sessions.Events(payload.SessionID)
+	if err != nil {
+		_ = c.writeError(env.ID, "session_events_failed", err.Error())
+		return
+	}
+	_ = c.write("session.events.result", env.ID, map[string]any{
+		"sessionId": payload.SessionID,
+		"events":    events,
+	})
 }
 
 func (c *wsClient) handleInterrupt(env Envelope) {
