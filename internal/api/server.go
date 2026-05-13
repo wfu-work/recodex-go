@@ -67,6 +67,18 @@ func (s *Server) PairingToken() string {
 	return s.pairingToken
 }
 
+func (s *Server) refreshPairingToken() string {
+	if !s.cfg.Security.PairingEnabled {
+		return ""
+	}
+	if token := s.PairingToken(); token != "" {
+		return token
+	}
+	s.pairingToken = auth.RandomToken(18)
+	s.pairingUntil = time.Now().Add(time.Duration(s.cfg.Security.PairingTTLSeconds) * time.Second)
+	return s.pairingToken
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
@@ -85,6 +97,7 @@ func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
+	token := s.refreshPairingToken()
 	host := r.Host
 	if host == "" {
 		host = s.cfg.Server.Address()
@@ -96,7 +109,7 @@ func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 	}
 	query := pairingURI.Query()
 	query.Set("baseUrl", baseURL)
-	query.Set("token", s.PairingToken())
+	query.Set("token", token)
 	pairingURI.RawQuery = query.Encode()
 
 	lanHost := localIP()
@@ -106,9 +119,9 @@ func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 		"lanHost":        lanHost,
 		"baseUrl":        baseURL,
 		"wsUrl":          "ws://" + host + "/ws",
-		"token":          s.PairingToken(),
+		"token":          token,
 		"pairingUri":     pairingURI.String(),
-		"pairingEnabled": s.cfg.Security.PairingEnabled && s.PairingToken() != "",
+		"pairingEnabled": s.cfg.Security.PairingEnabled && token != "",
 		"expiresAt":      s.pairingUntil,
 	})
 }
