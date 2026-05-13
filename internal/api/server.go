@@ -84,6 +84,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /version", s.version)
 	mux.HandleFunc("GET /pairing", s.pairing)
+	mux.HandleFunc("GET /context", s.context)
 	mux.HandleFunc("/ws", s.ws)
 	return withCORS(mux)
 }
@@ -94,6 +95,30 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"name": "rcc-bridge", "version": Version})
+}
+
+func (s *Server) context(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.contextPayload(""))
+}
+
+func (s *Server) contextPayload(workspacePath string) map[string]any {
+	branch := ""
+	if workspacePath != "" {
+		if snapshot, err := gitops.Snapshot(context.Background(), workspacePath, false); err == nil {
+			branch = snapshot.Branch
+		}
+	}
+	return map[string]any{
+		"transport":              "Local",
+		"model":                  s.cfg.Codex.Model,
+		"models":                 s.cfg.Codex.Models,
+		"reasoningEffort":        s.cfg.Codex.ReasoningEffort,
+		"reasoningEfforts":       []string{"low", "medium", "high", "xhigh"},
+		"approvalPolicy":         "on-request",
+		"requireConfirmGitWrite": s.cfg.Security.RequireConfirmForGitWrite,
+		"branch":                 branch,
+		"version":                Version,
+	}
 }
 
 func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +195,8 @@ func (c *wsClient) handle(ctx context.Context, env Envelope) {
 		_ = c.write("workspace.list.result", env.ID, map[string]any{"workspaces": c.server.workspaces.List()})
 	case "session.list":
 		_ = c.write("session.list.result", env.ID, map[string]any{"sessions": c.server.sessions.List()})
+	case "context.get":
+		c.handleContext(env)
 	case "session.events":
 		c.handleSessionEvents(env)
 	case "device.list":
@@ -250,8 +277,22 @@ type workspacePayload struct {
 }
 
 type sessionStartPayload struct {
-	Workspace string `json:"workspace"`
-	Prompt    string `json:"prompt"`
+	Workspace       string `json:"workspace"`
+	Prompt          string `json:"prompt"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoningEffort"`
+}
+
+func (c *wsClient) handleContext(env Envelope) {
+	var payload workspacePayload
+	_ = json.Unmarshal(env.Payload, &payload)
+	branch := ""
+	if payload.Workspace != "" {
+		if ws, err := c.server.workspaces.Resolve(payload.Workspace); err == nil {
+			branch = ws.Path
+		}
+	}
+	_ = c.write("context.result", env.ID, c.server.contextPayload(branch))
 }
 
 func (c *wsClient) handleSessionStart(ctx context.Context, env Envelope) {
@@ -265,7 +306,12 @@ func (c *wsClient) handleSessionStart(ctx context.Context, env Envelope) {
 		_ = c.writeError(env.ID, "workspace_denied", err.Error())
 		return
 	}
-	record, events, err := c.server.sessions.Start(ctx, ws.Path, payload.Prompt)
+	record, events, err := c.server.sessions.Start(ctx, codex.StartRequest{
+		Workspace:       ws.Path,
+		Prompt:          payload.Prompt,
+		Model:           payload.Model,
+		ReasoningEffort: payload.ReasoningEffort,
+	})
 	if err != nil {
 		_ = c.writeError(env.ID, "session_start_failed", err.Error())
 		return

@@ -22,6 +22,37 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadResolvesStateDirRelativeToConfigFile(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "bridge.yaml")
+	raw := []byte("state:\n  dir: .recodex\n")
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get wd: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(originalWD); err != nil {
+			t.Fatalf("restore wd: %v", err)
+		}
+	}()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	want := filepath.Join(root, ".recodex")
+	if cfg.State.Dir != want {
+		t.Fatalf("state dir should be relative to config file, got %q want %q", cfg.State.Dir, want)
+	}
+}
+
 func TestReadCodexProjects(t *testing.T) {
 	root := t.TempDir()
 	app := filepath.Join(root, "app")

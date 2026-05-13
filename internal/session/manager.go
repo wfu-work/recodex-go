@@ -131,23 +131,20 @@ func (m *Manager) Events(id string) ([]codex.Event, error) {
 	return events, nil
 }
 
-func (m *Manager) Start(parent context.Context, workspacePath, prompt string) (Record, <-chan codex.Event, error) {
+func (m *Manager) Start(parent context.Context, req codex.StartRequest) (Record, <-chan codex.Event, error) {
 	now := time.Now()
 	record := Record{
 		ID:        "s_" + auth.RandomToken(9),
-		Workspace: workspacePath,
-		Prompt:    prompt,
+		Workspace: req.Workspace,
+		Prompt:    req.Prompt,
 		Status:    StatusRunning,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
 	ctx, cancel := context.WithCancel(parent)
 
-	events, err := m.adapter.Run(ctx, codex.StartRequest{
-		SessionID: record.ID,
-		Workspace: workspacePath,
-		Prompt:    prompt,
-	})
+	req.SessionID = record.ID
+	events, err := m.adapter.Run(ctx, req)
 	if err != nil {
 		cancel()
 		return Record{}, nil, err

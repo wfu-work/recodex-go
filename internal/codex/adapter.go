@@ -15,9 +15,11 @@ import (
 )
 
 type StartRequest struct {
-	SessionID string
-	Workspace string
-	Prompt    string
+	SessionID       string
+	Workspace       string
+	Prompt          string
+	Model           string
+	ReasoningEffort string
 }
 
 type Event struct {
@@ -49,8 +51,19 @@ func (a CLIAdapter) Run(ctx context.Context, req StartRequest) (<-chan Event, er
 	}
 
 	args := []string{"exec", "--json", "--color", "never", "--skip-git-repo-check", "--cd", req.Workspace}
-	if a.cfg.Model != "" {
-		args = append(args, "--model", a.cfg.Model)
+	model := req.Model
+	if model == "" {
+		model = a.cfg.Model
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	reasoningEffort := req.ReasoningEffort
+	if reasoningEffort == "" {
+		reasoningEffort = a.cfg.ReasoningEffort
+	}
+	if reasoningEffort != "" {
+		args = append(args, "--config", "model_reasoning_effort=\""+reasoningEffort+"\"")
 	}
 	args = append(args, req.Prompt)
 

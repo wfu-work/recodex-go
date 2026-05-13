@@ -29,9 +29,11 @@ func (c ServerConfig) Address() string {
 }
 
 type CodexConfig struct {
-	Mode   string `yaml:"mode" json:"mode"`
-	Binary string `yaml:"binary" json:"binary"`
-	Model  string `yaml:"model" json:"model"`
+	Mode            string   `yaml:"mode" json:"mode"`
+	Binary          string   `yaml:"binary" json:"binary"`
+	Model           string   `yaml:"model" json:"model"`
+	Models          []string `yaml:"models" json:"models"`
+	ReasoningEffort string   `yaml:"reasoning_effort" json:"reasoningEffort"`
 }
 
 type WorkspaceConfig struct {
@@ -66,7 +68,7 @@ func Load(path string) (Config, error) {
 	cfg := Default()
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if err := normalize(&cfg); err != nil {
+			if err := normalize(&cfg, ""); err != nil {
 				return Config{}, err
 			}
 			return cfg, nil
@@ -81,13 +83,13 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, err
 	}
-	if err := normalize(&cfg); err != nil {
+	if err := normalize(&cfg, filepath.Dir(path)); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-func normalize(cfg *Config) error {
+func normalize(cfg *Config, baseDir string) error {
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "127.0.0.1"
 	}
@@ -100,6 +102,21 @@ func normalize(cfg *Config) error {
 	if cfg.Codex.Mode == "" {
 		cfg.Codex.Mode = "cli"
 	}
+	if cfg.Codex.Model == "" {
+		cfg.Codex.Model = "gpt-5.5"
+	}
+	if len(cfg.Codex.Models) == 0 {
+		cfg.Codex.Models = []string{
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+			"gpt-5.3-codex",
+			"gpt-5.2",
+		}
+	}
+	if cfg.Codex.ReasoningEffort == "" {
+		cfg.Codex.ReasoningEffort = "medium"
+	}
 	if cfg.Security.PairingTTLSeconds == 0 {
 		cfg.Security.PairingTTLSeconds = 300
 	}
@@ -107,7 +124,11 @@ func normalize(cfg *Config) error {
 		cfg.State.Dir = ".recodex"
 	}
 
-	stateDir, err := filepath.Abs(cfg.State.Dir)
+	stateDir := cfg.State.Dir
+	if !filepath.IsAbs(stateDir) && baseDir != "" {
+		stateDir = filepath.Join(baseDir, stateDir)
+	}
+	stateDir, err := filepath.Abs(stateDir)
 	if err != nil {
 		return err
 	}
