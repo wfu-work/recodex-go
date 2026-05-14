@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -125,6 +127,7 @@ func (s *Server) contextPayload(workspacePath string) map[string]any {
 		"codexBinary":            s.cfg.Codex.Binary,
 		"codexVersion":           s.codexVersion(),
 		"apiKeyConfigured":       apiKeyConfigured(),
+		"usage":                  s.sessions.UsageSummary(usageRatePer1KTokens()),
 	}
 }
 
@@ -149,6 +152,18 @@ func apiKeyConfigured() bool {
 		}
 	}
 	return false
+}
+
+func usageRatePer1KTokens() float64 {
+	raw := strings.TrimSpace(os.Getenv("RECODEX_TOKEN_USD_PER_1K"))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || value < 0 {
+		return 0
+	}
+	return value
 }
 
 func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {

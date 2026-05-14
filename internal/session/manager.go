@@ -38,6 +38,16 @@ type Record struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+type UsageSummary struct {
+	TodayTokens    int       `json:"todayTokens"`
+	MonthTokens    int       `json:"monthTokens"`
+	TodayCost      float64   `json:"todayCost"`
+	MonthCost      float64   `json:"monthCost"`
+	LastUpdated    time.Time `json:"lastUpdated,omitempty"`
+	CanReadUsage   bool      `json:"canReadUsage"`
+	RateConfigured bool      `json:"rateConfigured"`
+}
+
 type Manager struct {
 	mu           sync.Mutex
 	path         string
@@ -129,6 +139,56 @@ func (m *Manager) Events(id string) ([]codex.Event, error) {
 		return nil, err
 	}
 	return events, nil
+}
+
+func (m *Manager) UsageSummary(ratePer1KTokens float64) UsageSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	todayYear, todayMonth, todayDay := now.Date()
+	summary := UsageSummary{
+		CanReadUsage:   true,
+		RateConfigured: ratePer1KTokens > 0,
+	}
+	entries, err := os.ReadDir(m.eventsDir)
+	if err != nil {
+		summary.CanReadUsage = false
+		return summary
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(m.eventsDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var events []codex.Event
+		if err := json.Unmarshal(raw, &events); err != nil {
+			continue
+		}
+		for _, event := range events {
+			if event.Usage == nil || event.Usage.TotalTokens <= 0 {
+				continue
+			}
+			if event.Time.After(summary.LastUpdated) {
+				summary.LastUpdated = event.Time
+			}
+			year, month, day := event.Time.Date()
+			if year == todayYear && month == todayMonth && day == todayDay {
+				summary.TodayTokens += event.Usage.TotalTokens
+			}
+			if year == todayYear && month == todayMonth {
+				summary.MonthTokens += event.Usage.TotalTokens
+			}
+		}
+	}
+	if ratePer1KTokens > 0 {
+		summary.TodayCost = float64(summary.TodayTokens) / 1000 * ratePer1KTokens
+		summary.MonthCost = float64(summary.MonthTokens) / 1000 * ratePer1KTokens
+	}
+	return summary
 }
 
 func (m *Manager) Start(parent context.Context, req codex.StartRequest) (Record, <-chan codex.Event, error) {

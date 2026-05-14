@@ -32,6 +32,16 @@ var ignoredEventTypes = map[string]bool{
 	"response.content_part.done":  true,
 }
 
+var runningEventLabels = map[string]string{
+	"thread.started":              "正在准备会话...",
+	"turn.started":                "正在思考...",
+	"item.started":                "正在处理任务...",
+	"response.created":            "正在连接模型...",
+	"response.in_progress":        "正在思考...",
+	"response.output_item.added":  "正在生成回复...",
+	"response.content_part.added": "正在生成回复...",
+}
+
 type StartRequest struct {
 	SessionID       string
 	Workspace       string
@@ -46,6 +56,13 @@ type Event struct {
 	Text      string    `json:"text,omitempty"`
 	Raw       string    `json:"raw,omitempty"`
 	Time      time.Time `json:"time"`
+	Usage     *Usage    `json:"usage,omitempty"`
+}
+
+type Usage struct {
+	InputTokens  int `json:"inputTokens"`
+	OutputTokens int `json:"outputTokens"`
+	TotalTokens  int `json:"totalTokens"`
 }
 
 type Adapter interface {
@@ -144,13 +161,31 @@ func parseLine(sessionID, fallbackKind, line string) (Event, bool) {
 	if err := json.Unmarshal([]byte(line), &data); err != nil {
 		return event, true
 	}
+	event.Text = ""
 	if value, ok := data["type"].(string); ok && value != "" {
 		event.Kind = value
 	}
 	if text := firstText(data); text != "" {
 		event.Text = text
 	}
+	if usage := firstUsage(data); usage != nil {
+		event.Kind = "token_usage"
+		event.Text = "Token 用量"
+		event.Usage = usage
+		return event, true
+	}
 	event.Kind = normalizeKind(event.Kind, data)
+	if isToolKind(event.Kind) {
+		event.Kind = "tool_call"
+		if command := firstCommand(data); command != "" {
+			event.Text = "command: " + command
+		}
+	}
+	if label, ok := runningEventLabels[event.Kind]; ok && event.Text == "" {
+		event.Kind = "running"
+		event.Text = label
+		return event, true
+	}
 	if event.Text == "" || ignoredEventTypes[event.Kind] {
 		return Event{}, false
 	}
@@ -175,13 +210,24 @@ func normalizeKind(kind string, data map[string]any) string {
 		return "assistant"
 	case kind == "user_message":
 		return "user"
-	case strings.Contains(kind, "tool_call"):
+	case isToolKind(kind):
 		return "tool_call"
 	case strings.Contains(kind, "error"):
 		return "error"
 	default:
 		return kind
 	}
+}
+
+func isToolKind(kind string) bool {
+	normalized := strings.ToLower(kind)
+	return strings.Contains(normalized, "tool_call") ||
+		strings.Contains(normalized, "function_call") ||
+		strings.Contains(normalized, "exec_command") ||
+		strings.Contains(normalized, "command_execution") ||
+		strings.Contains(normalized, "shell_command") ||
+		strings.Contains(normalized, "local_shell") ||
+		strings.Contains(normalized, "mcp_tool")
 }
 
 func firstText(data map[string]any) string {
@@ -222,4 +268,85 @@ func firstTextFromList(items []any) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func firstCommand(data map[string]any) string {
+	for _, key := range []string{"cmd", "command", "shell_command", "exec_command", "program", "name"} {
+		if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	for _, key := range []string{"arguments", "args", "input", "params"} {
+		switch value := data[key].(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		case []any:
+			parts := make([]string, 0, len(value))
+			for _, entry := range value {
+				if text, ok := entry.(string); ok && strings.TrimSpace(text) != "" {
+					parts = append(parts, strings.TrimSpace(text))
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, " ")
+			}
+		}
+	}
+	for _, key := range []string{"item", "call", "tool_call", "function_call", "action", "delta"} {
+		if child, ok := data[key].(map[string]any); ok {
+			if command := firstCommand(child); command != "" {
+				return command
+			}
+		}
+	}
+	return ""
+}
+
+func firstUsage(data map[string]any) *Usage {
+	for _, key := range []string{"usage", "token_count", "tokenCount"} {
+		if child, ok := data[key].(map[string]any); ok {
+			if usage := usageFromMap(child); usage.TotalTokens > 0 {
+				return &usage
+			}
+		}
+	}
+	if usage := usageFromMap(data); usage.TotalTokens > 0 {
+		return &usage
+	}
+	for _, key := range []string{"item", "message", "delta", "output", "response"} {
+		if child, ok := data[key].(map[string]any); ok {
+			if usage := firstUsage(child); usage != nil {
+				return usage
+			}
+		}
+	}
+	return nil
+}
+
+func usageFromMap(data map[string]any) Usage {
+	input := intValue(data, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
+	output := intValue(data, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
+	total := intValue(data, "total_tokens", "totalTokens")
+	if total == 0 {
+		total = input + output
+	}
+	return Usage{InputTokens: input, OutputTokens: output, TotalTokens: total}
+}
+
+func intValue(data map[string]any, keys ...string) int {
+	for _, key := range keys {
+		switch value := data[key].(type) {
+		case float64:
+			return int(value)
+		case int:
+			return value
+		case json.Number:
+			if number, err := value.Int64(); err == nil {
+				return int(number)
+			}
+		}
+	}
+	return 0
 }

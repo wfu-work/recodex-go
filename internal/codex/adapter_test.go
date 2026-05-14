@@ -70,16 +70,62 @@ func TestParseLineNormalizesAgentMessageDelta(t *testing.T) {
 	}
 }
 
-func TestParseLineSuppressesStructuralCodexEvents(t *testing.T) {
-	_, ok := parseLine("s_1", "stdout", `{"type":"thread.started","thread_id":"abc"}`)
+func TestParseLineEmitsStructuralRunningEvents(t *testing.T) {
+	event, ok := parseLine("s_1", "stdout", `{"type":"thread.started","thread_id":"abc"}`)
 	if ok {
-		t.Fatal("structural event should not be emitted")
+		if event.Kind != "running" {
+			t.Fatalf("unexpected kind: %s", event.Kind)
+		}
+		return
 	}
+	t.Fatal("structural running event should be emitted")
 }
 
 func TestParseLineSuppressesJsonWithoutReadableText(t *testing.T) {
-	_, ok := parseLine("s_1", "stdout", `{"type":"turn.completed","usage":{"input_tokens":1}}`)
+	_, ok := parseLine("s_1", "stdout", `{"type":"turn.completed","usage":{}}`)
 	if ok {
 		t.Fatal("json without readable text should not be emitted")
+	}
+}
+
+func TestParseLineEmitsRunningStatus(t *testing.T) {
+	event, ok := parseLine("s_1", "stdout", `{"type":"response.in_progress"}`)
+	if !ok {
+		t.Fatal("running event should be emitted")
+	}
+	if event.Kind != "running" {
+		t.Fatalf("unexpected kind: %s", event.Kind)
+	}
+	if event.Text == "" {
+		t.Fatal("running event should have readable text")
+	}
+}
+
+func TestParseLineExtractsToolCommand(t *testing.T) {
+	event, ok := parseLine("s_1", "stdout", `{"type":"exec_command","arguments":["flutter","analyze"]}`)
+	if !ok {
+		t.Fatal("tool command should be emitted")
+	}
+	if event.Kind != "tool_call" {
+		t.Fatalf("unexpected kind: %s", event.Kind)
+	}
+	if event.Text != "command: flutter analyze" {
+		t.Fatalf("unexpected text: %s", event.Text)
+	}
+}
+
+func TestParseLineExtractsUsage(t *testing.T) {
+	event, ok := parseLine("s_1", "stdout", `{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}`)
+	if !ok {
+		t.Fatal("usage event should be emitted")
+	}
+	if event.Kind != "token_usage" {
+		t.Fatalf("unexpected kind: %s", event.Kind)
+	}
+	if event.Usage == nil {
+		t.Fatal("usage should be set")
+	}
+	if event.Usage.InputTokens != 12 || event.Usage.OutputTokens != 8 || event.Usage.TotalTokens != 20 {
+		t.Fatalf("unexpected usage: %+v", event.Usage)
 	}
 }
