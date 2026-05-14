@@ -17,7 +17,10 @@ import (
 	"recodex-go/internal/codex"
 )
 
-const codexHistoryIDPrefix = "codex_"
+const (
+	codexHistoryIDPrefix = "codex_"
+	codexHistoryLiveTTL  = 90 * time.Second
+)
 
 type Status string
 
@@ -63,6 +66,7 @@ type codexHistorySession struct {
 	Path      string
 	Workspace string
 	Prompt    string
+	Status    Status
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -93,6 +97,7 @@ func NewManager(stateDir string, adapter codex.Adapter) (*Manager, error) {
 func (m *Manager) List() []Record {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	_ = m.loadCodexHistoryLocked()
 	out := make([]Record, 0, len(m.records))
 	for _, record := range m.records {
 		out = append(out, record)
@@ -102,7 +107,7 @@ func (m *Manager) List() []Record {
 			ID:        codexHistoryIDPrefix + item.ID,
 			Workspace: item.Workspace,
 			Prompt:    item.Prompt,
-			Status:    StatusDone,
+			Status:    item.Status,
 			CreatedAt: item.CreatedAt,
 			UpdatedAt: item.UpdatedAt,
 		})
@@ -117,12 +122,13 @@ func (m *Manager) Events(id string) ([]codex.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if strings.HasPrefix(id, codexHistoryIDPrefix) {
+		_ = m.loadCodexHistoryLocked()
 		historyID := strings.TrimPrefix(id, codexHistoryIDPrefix)
 		item, ok := m.codexHistory[historyID]
 		if !ok {
 			return nil, errors.New("session not found")
 		}
-		return readCodexHistoryEvents(item.Path, historyID)
+		return readCodexHistoryEvents(item, historyID)
 	}
 	if _, ok := m.records[id]; !ok {
 		return nil, errors.New("session not found")
@@ -298,7 +304,11 @@ func (m *Manager) appendEvent(id string, event codex.Event) {
 	if err == nil {
 		_ = json.Unmarshal(raw, &events)
 	}
-	events = append(events, event)
+	if len(events) > 0 && isLiveStatusEvent(event) && isLiveStatusEvent(events[len(events)-1]) {
+		events[len(events)-1] = event
+	} else {
+		events = append(events, event)
+	}
 	next, err := json.MarshalIndent(events, "", "  ")
 	if err != nil {
 		return
@@ -306,17 +316,28 @@ func (m *Manager) appendEvent(id string, event codex.Event) {
 	_ = os.WriteFile(path, next, 0o600)
 }
 
+func isLiveStatusEvent(event codex.Event) bool {
+	return event.Kind == "running" || event.Kind == "tool_call"
+}
+
 func (m *Manager) eventsPath(id string) string {
 	return filepath.Join(m.eventsDir, id+".json")
 }
 
 func (m *Manager) loadCodexHistory() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.loadCodexHistoryLocked()
+}
+
+func (m *Manager) loadCodexHistoryLocked() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
 	root := filepath.Join(home, ".codex", "sessions")
-	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	next := map[string]codexHistorySession{}
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
 		}
@@ -324,9 +345,13 @@ func (m *Manager) loadCodexHistory() error {
 		if err != nil || item.ID == "" || item.Workspace == "" {
 			return nil
 		}
-		m.codexHistory[item.ID] = item
+		next[item.ID] = item
 		return nil
 	})
+	if err == nil {
+		m.codexHistory = next
+	}
+	return err
 }
 
 type codexHistoryLine struct {
@@ -354,6 +379,7 @@ func readCodexHistorySummary(path string) (codexHistorySession, error) {
 	defer file.Close()
 
 	item := codexHistorySession{Path: path}
+	completed := false
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -379,22 +405,35 @@ func readCodexHistorySummary(path string) (codexHistorySession, error) {
 			}
 		case "event_msg":
 			if item.Prompt != "" {
+				var payload codexHistoryEventPayload
+				if err := json.Unmarshal(line.Payload, &payload); err == nil && payload.Type == "task_complete" {
+					completed = true
+				}
 				continue
 			}
 			var payload codexHistoryEventPayload
-			if err := json.Unmarshal(line.Payload, &payload); err == nil && payload.Type == "user_message" {
-				item.Prompt = cleanUserPrompt(payload.Message)
+			if err := json.Unmarshal(line.Payload, &payload); err == nil {
+				if payload.Type == "user_message" {
+					item.Prompt = cleanUserPrompt(payload.Message)
+				}
+				if payload.Type == "task_complete" {
+					completed = true
+				}
 			}
 		}
 	}
 	if item.UpdatedAt.IsZero() {
 		item.UpdatedAt = item.CreatedAt
 	}
+	item.Status = StatusDone
+	if !completed && time.Since(item.UpdatedAt) <= codexHistoryLiveTTL {
+		item.Status = StatusRunning
+	}
 	return item, scanner.Err()
 }
 
-func readCodexHistoryEvents(path, sessionID string) ([]codex.Event, error) {
-	file, err := os.Open(path)
+func readCodexHistoryEvents(item codexHistorySession, sessionID string) ([]codex.Event, error) {
+	file, err := os.Open(item.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +467,28 @@ func readCodexHistoryEvents(path, sessionID string) ([]codex.Event, error) {
 			Time:      parseCodexTime(line.Timestamp),
 		})
 	}
+	if item.Status == StatusRunning {
+		events = appendLiveCodexHistoryEvent(events, sessionID, item.UpdatedAt)
+	}
 	return events, scanner.Err()
+}
+
+func appendLiveCodexHistoryEvent(events []codex.Event, sessionID string, at time.Time) []codex.Event {
+	if len(events) > 0 && isLiveStatusEvent(events[len(events)-1]) {
+		events[len(events)-1] = codex.Event{
+			SessionID: codexHistoryIDPrefix + sessionID,
+			Kind:      "running",
+			Text:      "正在同步电脑端 Codex 执行...",
+			Time:      at,
+		}
+		return events
+	}
+	return append(events, codex.Event{
+		SessionID: codexHistoryIDPrefix + sessionID,
+		Kind:      "running",
+		Text:      "正在同步电脑端 Codex 执行...",
+		Time:      at,
+	})
 }
 
 func cleanUserPrompt(value string) string {
