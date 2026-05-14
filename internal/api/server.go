@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,7 +121,34 @@ func (s *Server) contextPayload(workspacePath string) map[string]any {
 		"requireConfirmGitWrite": s.cfg.Security.RequireConfirmForGitWrite,
 		"branch":                 branch,
 		"version":                Version,
+		"bridgeVersion":          Version,
+		"codexBinary":            s.cfg.Codex.Binary,
+		"codexVersion":           s.codexVersion(),
+		"apiKeyConfigured":       apiKeyConfigured(),
 	}
+}
+
+func (s *Server) codexVersion() string {
+	binary := s.cfg.Codex.Binary
+	if binary == "" {
+		binary = "codex"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, binary, "--version").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func apiKeyConfigured() bool {
+	for _, key := range []string{"OPENAI_API_KEY", "CODEX_API_KEY"} {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {

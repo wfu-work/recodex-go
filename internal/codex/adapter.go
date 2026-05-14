@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,24 +135,41 @@ func parseLine(sessionID, fallbackKind, line string) Event {
 }
 
 func firstText(data map[string]any) string {
-	for _, key := range []string{"text", "message", "delta"} {
+	for _, key := range []string{"text", "message", "delta", "output_text", "summary", "content"} {
 		if value, ok := data[key].(string); ok && value != "" {
 			return value
 		}
 	}
-	if item, ok := data["item"].(map[string]any); ok {
-		if text := firstText(item); text != "" {
-			return text
+	for _, key := range []string{"item", "message", "delta", "output", "response"} {
+		if child, ok := data[key].(map[string]any); ok {
+			if text := firstText(child); text != "" {
+				return text
+			}
 		}
-		if content, ok := item["content"].([]any); ok {
-			for _, entry := range content {
-				if entryMap, ok := entry.(map[string]any); ok {
-					if text := firstText(entryMap); text != "" {
-						return text
-					}
-				}
+	}
+	for _, key := range []string{"content", "items", "output"} {
+		if content, ok := data[key].([]any); ok {
+			if text := firstTextFromList(content); text != "" {
+				return text
 			}
 		}
 	}
 	return ""
+}
+
+func firstTextFromList(items []any) string {
+	var parts []string
+	for _, entry := range items {
+		switch value := entry.(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				parts = append(parts, value)
+			}
+		case map[string]any:
+			if text := firstText(value); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
 }

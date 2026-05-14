@@ -24,3 +24,20 @@ func TestParseLineFallsBackToPlainText(t *testing.T) {
 		t.Fatalf("unexpected text: %s", event.Text)
 	}
 }
+
+func TestParseLineExtractsNestedItemContentText(t *testing.T) {
+	event := parseLine("s_1", "stdout", `{"type":"event_msg","item":{"type":"agent_message","content":[{"type":"output_text","text":"hello from nested content"}]}}`)
+	if event.Kind != "event_msg" {
+		t.Fatalf("unexpected kind: %s", event.Kind)
+	}
+	if event.Text != "hello from nested content" {
+		t.Fatalf("unexpected text: %s", event.Text)
+	}
+}
+
+func TestParseLineExtractsContentArrayText(t *testing.T) {
+	event := parseLine("s_1", "stdout", `{"type":"response.output_text.delta","delta":{"content":[{"text":"first"},{"text":"second"}]}}`)
+	if event.Text != "first\nsecond" {
+		t.Fatalf("unexpected text: %s", event.Text)
+	}
+}
