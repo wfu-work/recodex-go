@@ -15,6 +15,23 @@ import (
 	"recodex-go/internal/config"
 )
 
+var ignoredEventTypes = map[string]bool{
+	"thread.started":              true,
+	"turn.started":                true,
+	"turn.completed":              true,
+	"turn.failed":                 true,
+	"item.started":                true,
+	"item.completed":              true,
+	"token_count":                 true,
+	"response.created":            true,
+	"response.in_progress":        true,
+	"response.completed":          true,
+	"response.output_item.added":  true,
+	"response.output_item.done":   true,
+	"response.content_part.added": true,
+	"response.content_part.done":  true,
+}
+
 type StartRequest struct {
 	SessionID       string
 	Workspace       string
@@ -111,19 +128,21 @@ func scanLines(wg *sync.WaitGroup, events chan<- Event, sessionID, kind string, 
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
-		event := parseLine(sessionID, kind, scanner.Text())
-		events <- event
+		event, ok := parseLine(sessionID, kind, scanner.Text())
+		if ok {
+			events <- event
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		events <- Event{SessionID: sessionID, Kind: "error", Text: err.Error(), Time: time.Now()}
 	}
 }
 
-func parseLine(sessionID, fallbackKind, line string) Event {
+func parseLine(sessionID, fallbackKind, line string) (Event, bool) {
 	event := Event{SessionID: sessionID, Kind: fallbackKind, Text: line, Raw: line, Time: time.Now()}
 	var data map[string]any
 	if err := json.Unmarshal([]byte(line), &data); err != nil {
-		return event
+		return event, true
 	}
 	if value, ok := data["type"].(string); ok && value != "" {
 		event.Kind = value
@@ -131,7 +150,38 @@ func parseLine(sessionID, fallbackKind, line string) Event {
 	if text := firstText(data); text != "" {
 		event.Text = text
 	}
-	return event
+	event.Kind = normalizeKind(event.Kind, data)
+	if event.Text == "" || ignoredEventTypes[event.Kind] {
+		return Event{}, false
+	}
+	return event, true
+}
+
+func normalizeKind(kind string, data map[string]any) string {
+	if item, ok := data["item"].(map[string]any); ok {
+		if itemType, ok := item["type"].(string); ok && itemType != "" {
+			kind = itemType
+		}
+	}
+	switch {
+	case kind == "agent_message",
+		kind == "agent_message_delta",
+		kind == "assistant_message",
+		kind == "assistant_message_delta",
+		kind == "message_delta",
+		kind == "output_text",
+		strings.HasPrefix(kind, "response.output_text"),
+		strings.HasPrefix(kind, "response.reasoning_summary_text"):
+		return "assistant"
+	case kind == "user_message":
+		return "user"
+	case strings.Contains(kind, "tool_call"):
+		return "tool_call"
+	case strings.Contains(kind, "error"):
+		return "error"
+	default:
+		return kind
+	}
 }
 
 func firstText(data map[string]any) string {
