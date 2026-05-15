@@ -15,6 +15,18 @@ All WebSocket messages are JSON envelopes:
 - `GET /healthz`
 - `GET /version`
 - `GET /pairing`
+- `GET /context`
+- `GET /workspaces`
+- `GET /devices`
+- `GET /sessions`
+- `GET /sessions/{id}/events`
+- `GET /git/status?workspace=<path-or-name>`
+- `GET /git/diff?workspace=<path-or-name>`
+- `POST /git/commit`
+- `POST /git/push`
+- `POST /git/undo`
+
+These HTTP endpoints are available without WebSocket authentication for the bundled local web console. Git write endpoints still honor `security.require_confirm_for_git_write` and return `confirm.required`-style payloads when confirmation is required.
 
 `GET /pairing` returns:
 

@@ -51,12 +51,19 @@ type StartRequest struct {
 }
 
 type Event struct {
-	SessionID string    `json:"sessionId"`
-	Kind      string    `json:"kind"`
-	Text      string    `json:"text,omitempty"`
-	Raw       string    `json:"raw,omitempty"`
-	Time      time.Time `json:"time"`
-	Usage     *Usage    `json:"usage,omitempty"`
+	SessionID   string       `json:"sessionId"`
+	Kind        string       `json:"kind"`
+	Text        string       `json:"text,omitempty"`
+	Raw         string       `json:"raw,omitempty"`
+	Time        time.Time    `json:"time"`
+	Usage       *Usage       `json:"usage,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+type Attachment struct {
+	Type    string `json:"type"`
+	Mime    string `json:"mime,omitempty"`
+	DataURL string `json:"dataUrl,omitempty"`
 }
 
 type Usage struct {

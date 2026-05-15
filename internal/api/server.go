@@ -90,6 +90,18 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /version", s.version)
 	mux.HandleFunc("GET /pairing", s.pairing)
 	mux.HandleFunc("GET /context", s.context)
+	mux.HandleFunc("GET /workspaces", s.workspaceList)
+	mux.HandleFunc("GET /devices", s.deviceList)
+	mux.HandleFunc("DELETE /devices/{id}", s.deviceRevoke)
+	mux.HandleFunc("GET /sessions", s.sessionList)
+	mux.HandleFunc("POST /sessions/start", s.sessionStart)
+	mux.HandleFunc("GET /sessions/{id}/events", s.sessionEvents)
+	mux.HandleFunc("POST /sessions/{id}/interrupt", s.sessionInterrupt)
+	mux.HandleFunc("GET /git/status", s.gitStatus)
+	mux.HandleFunc("GET /git/diff", s.gitDiff)
+	mux.HandleFunc("POST /git/commit", s.gitCommit)
+	mux.HandleFunc("POST /git/push", s.gitPush)
+	mux.HandleFunc("POST /git/undo", s.gitUndo)
 	mux.HandleFunc("/ws", s.ws)
 	return withCORS(mux)
 }
@@ -104,6 +116,149 @@ func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) context(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.contextPayload(""))
+}
+
+func (s *Server) workspaceList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"workspaces": s.workspaces.List()})
+}
+
+func (s *Server) deviceList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"devices": s.devices.Devices()})
+}
+
+func (s *Server) deviceRevoke(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("id")
+	if err := s.devices.Revoke(deviceID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"code": "device_revoke_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deviceId": deviceID})
+}
+
+func (s *Server) sessionList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": s.sessions.List()})
+}
+
+func (s *Server) sessionStart(w http.ResponseWriter, r *http.Request) {
+	var payload sessionStartPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
+		return
+	}
+	ws, err := s.workspaces.Resolve(payload.Workspace)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"code": "workspace_denied", "message": err.Error()})
+		return
+	}
+	record, events, err := s.sessions.Start(r.Context(), codex.StartRequest{
+		Workspace:       ws.Path,
+		Prompt:          payload.Prompt,
+		Model:           payload.Model,
+		ReasoningEffort: payload.ReasoningEffort,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": "session_start_failed", "message": err.Error()})
+		return
+	}
+	go func() {
+		for range events {
+		}
+	}()
+	writeJSON(w, http.StatusOK, record)
+}
+
+func (s *Server) sessionEvents(w http.ResponseWriter, r *http.Request) {
+	events, err := s.sessions.Events(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"code": "session_events_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": r.PathValue("id"), "events": events})
+}
+
+func (s *Server) sessionInterrupt(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+	if err := s.sessions.Interrupt(sessionID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "interrupt_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID})
+}
+
+func (s *Server) gitStatus(w http.ResponseWriter, r *http.Request) {
+	s.gitSnapshot(w, r, false)
+}
+
+func (s *Server) gitDiff(w http.ResponseWriter, r *http.Request) {
+	s.gitSnapshot(w, r, true)
+}
+
+func (s *Server) gitSnapshot(w http.ResponseWriter, r *http.Request, includeDiff bool) {
+	ws, err := s.workspaces.Resolve(r.URL.Query().Get("workspace"))
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"code": "workspace_denied", "message": err.Error()})
+		return
+	}
+	result, err := gitops.Snapshot(r.Context(), ws.Path, includeDiff)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": "git_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
+	var payload gitWritePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
+		return
+	}
+	if s.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
+		writeJSON(w, http.StatusOK, map[string]any{"action": "git.commit", "message": "Commit requires confirmation."})
+		return
+	}
+	ws, err := s.workspaces.Resolve(payload.Workspace)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"code": "workspace_denied", "message": err.Error()})
+		return
+	}
+	output, err := gitops.Commit(r.Context(), ws.Path, payload.Message)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": "git_commit_failed", "message": err.Error() + "\n" + output})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"output": output})
+}
+
+func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
+	s.gitWrite(w, r, "git.push", "Push requires confirmation.", gitops.Push)
+}
+
+func (s *Server) gitUndo(w http.ResponseWriter, r *http.Request) {
+	s.gitWrite(w, r, "git.undo", "Undo changes requires confirmation.", gitops.Undo)
+}
+
+func (s *Server) gitWrite(w http.ResponseWriter, r *http.Request, action, confirmMessage string, run func(context.Context, string) (string, error)) {
+	var payload gitWritePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
+		return
+	}
+	if s.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
+		writeJSON(w, http.StatusOK, map[string]any{"action": action, "message": confirmMessage})
+		return
+	}
+	ws, err := s.workspaces.Resolve(payload.Workspace)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"code": "workspace_denied", "message": err.Error()})
+		return
+	}
+	output, err := run(r.Context(), ws.Path)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": action + "_failed", "message": err.Error() + "\n" + output})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"output": output})
 }
 
 func (s *Server) contextPayload(workspacePath string) map[string]any {

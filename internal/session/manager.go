@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ import (
 
 const (
 	codexHistoryIDPrefix = "codex_"
-	codexHistoryLiveTTL  = 90 * time.Second
+	codexHistoryLiveTTL  = 30 * time.Minute
 )
 
 type Status string
@@ -367,8 +368,16 @@ type codexHistoryMetaPayload struct {
 }
 
 type codexHistoryEventPayload struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	Type    string                           `json:"type"`
+	Message string                           `json:"message"`
+	Images  []string                         `json:"images"`
+	Changes map[string]codexHistoryPatchFile `json:"changes"`
+}
+
+type codexHistoryPatchFile struct {
+	Type        string  `json:"type"`
+	UnifiedDiff string  `json:"unified_diff"`
+	MovePath    *string `json:"move_path"`
 }
 
 func readCodexHistorySummary(path string) (codexHistorySession, error) {
@@ -404,16 +413,10 @@ func readCodexHistorySummary(path string) (codexHistorySession, error) {
 				}
 			}
 		case "event_msg":
-			if item.Prompt != "" {
-				var payload codexHistoryEventPayload
-				if err := json.Unmarshal(line.Payload, &payload); err == nil && payload.Type == "task_complete" {
-					completed = true
-				}
-				continue
-			}
 			var payload codexHistoryEventPayload
 			if err := json.Unmarshal(line.Payload, &payload); err == nil {
 				if payload.Type == "user_message" {
+					completed = false
 					item.Prompt = cleanUserPrompt(payload.Message)
 				}
 				if payload.Type == "task_complete" {
@@ -448,7 +451,34 @@ func readCodexHistoryEvents(item codexHistorySession, sessionID string) ([]codex
 			continue
 		}
 		var payload codexHistoryEventPayload
-		if err := json.Unmarshal(line.Payload, &payload); err != nil || payload.Message == "" {
+		if err := json.Unmarshal(line.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Type == "patch_apply_end" {
+			if text := codexHistoryPatchNumstat(payload); text != "" {
+				event := codex.Event{
+					SessionID: codexHistoryIDPrefix + sessionID,
+					Kind:      "git_change",
+					Text:      text,
+					Time:      parseCodexTime(line.Timestamp),
+				}
+				if len(events) > 0 && events[len(events)-1].Kind == event.Kind {
+					events[len(events)-1].Text += "\n" + event.Text
+				} else {
+					events = append(events, event)
+				}
+			}
+			continue
+		}
+		if payload.Type == "task_complete" {
+			events = append(events, codex.Event{
+				SessionID: codexHistoryIDPrefix + sessionID,
+				Kind:      "done",
+				Time:      parseCodexTime(line.Timestamp),
+			})
+			continue
+		}
+		if payload.Message == "" && len(payload.Images) == 0 {
 			continue
 		}
 		kind := ""
@@ -461,16 +491,118 @@ func readCodexHistoryEvents(item codexHistorySession, sessionID string) ([]codex
 			continue
 		}
 		events = append(events, codex.Event{
-			SessionID: codexHistoryIDPrefix + sessionID,
-			Kind:      kind,
-			Text:      cleanUserPrompt(payload.Message),
-			Time:      parseCodexTime(line.Timestamp),
+			SessionID:   codexHistoryIDPrefix + sessionID,
+			Kind:        kind,
+			Text:        cleanUserPrompt(payload.Message),
+			Time:        parseCodexTime(line.Timestamp),
+			Attachments: codexHistoryImageAttachments(payload.Images),
 		})
 	}
 	if item.Status == StatusRunning {
+		events = trimTerminalEventsAfterLastUser(events)
 		events = appendLiveCodexHistoryEvent(events, sessionID, item.UpdatedAt)
 	}
 	return events, scanner.Err()
+}
+
+func trimTerminalEventsAfterLastUser(events []codex.Event) []codex.Event {
+	lastUserIndex := -1
+	for index, event := range events {
+		if event.Kind == "user" {
+			lastUserIndex = index
+		}
+	}
+	if lastUserIndex < 0 {
+		return events
+	}
+	trimmed := events[:0]
+	for index, event := range events {
+		if index > lastUserIndex && isTerminalHistoryEvent(event) {
+			continue
+		}
+		trimmed = append(trimmed, event)
+	}
+	return trimmed
+}
+
+func isTerminalHistoryEvent(event codex.Event) bool {
+	switch event.Kind {
+	case "done", "interrupted", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexHistoryImageAttachments(images []string) []codex.Attachment {
+	if len(images) == 0 {
+		return nil
+	}
+	attachments := make([]codex.Attachment, 0, len(images))
+	for _, image := range images {
+		image = strings.TrimSpace(image)
+		if image == "" {
+			continue
+		}
+		attachments = append(attachments, codex.Attachment{
+			Type:    "image",
+			Mime:    dataURLMime(image),
+			DataURL: image,
+		})
+	}
+	return attachments
+}
+
+func dataURLMime(value string) string {
+	if !strings.HasPrefix(value, "data:") {
+		return ""
+	}
+	meta, _, ok := strings.Cut(value, ",")
+	if !ok {
+		return ""
+	}
+	mime := strings.TrimPrefix(meta, "data:")
+	mime, _, _ = strings.Cut(mime, ";")
+	return mime
+}
+
+func codexHistoryPatchNumstat(payload codexHistoryEventPayload) string {
+	if len(payload.Changes) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(payload.Changes))
+	for path, change := range payload.Changes {
+		displayPath := path
+		if change.MovePath != nil && strings.TrimSpace(*change.MovePath) != "" {
+			displayPath = strings.TrimSpace(*change.MovePath)
+		}
+		added, removed := countUnifiedDiffDelta(change.UnifiedDiff)
+		if change.Type == "delete" && added == 0 && removed == 0 {
+			removed = 1
+		}
+		if strings.TrimSpace(displayPath) == "" || added == 0 && removed == 0 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%d\t%d\t%s", added, removed, displayPath))
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+func countUnifiedDiffDelta(diff string) (int, int) {
+	added := 0
+	removed := 0
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			added++
+		case strings.HasPrefix(line, "-"):
+			removed++
+		}
+	}
+	return added, removed
 }
 
 func appendLiveCodexHistoryEvent(events []codex.Event, sessionID string, at time.Time) []codex.Event {

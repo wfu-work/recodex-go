@@ -77,6 +77,16 @@ http://127.0.0.1:8765
 - `GET /healthz`
 - `GET /version`
 - `GET /pairing`
+- `GET /context`
+- `GET /workspaces`
+- `GET /devices`
+- `GET /sessions`
+- `GET /sessions/{id}/events`
+- `GET /git/status?workspace=<path-or-name>`
+- `GET /git/diff?workspace=<path-or-name>`
+- `POST /git/commit`
+- `POST /git/push`
+- `POST /git/undo`
 - `WS /ws`
 
 ## 配置
