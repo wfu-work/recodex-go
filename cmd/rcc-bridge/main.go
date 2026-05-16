@@ -8,6 +8,7 @@ import (
 
 	"recodex-go/internal/api"
 	"recodex-go/internal/config"
+	"recodex-go/internal/serverlog"
 )
 
 func main() {
@@ -31,8 +32,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("rcc-bridge listening on http://%s", addr)
-	log.Printf("pairing token: %s", server.PairingToken())
+	log.Printf("Recodex Bridge 已启动: http://%s", addr)
+	serverlog.BridgeStartup(addr, server.PairingToken())
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
 	}

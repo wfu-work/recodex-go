@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"recodex-go/internal/relay"
+	"recodex-go/internal/serverlog"
 )
 
 func main() {
@@ -27,7 +28,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("rcc-relay listening on http://%s", *addr)
+	log.Printf("Recodex Relay 已启动: http://%s", *addr)
+	serverlog.RelayStartup(*addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve relay: %v", err)
 	}

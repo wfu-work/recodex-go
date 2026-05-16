@@ -9,6 +9,7 @@ import (
 	"recodex-go/internal/api"
 	"recodex-go/internal/config"
 	"recodex-go/internal/relay"
+	"recodex-go/internal/serverlog"
 )
 
 func main() {
@@ -48,15 +49,16 @@ func main() {
 
 	errCh := make(chan error, 2)
 	go func() {
-		log.Printf("rcc-bridge listening on http://%s", bridgeAddr)
-		log.Printf("pairing token: %s", bridge.PairingToken())
+		log.Printf("Recodex Bridge 已启动: http://%s", bridgeAddr)
+		serverlog.BridgeStartup(bridgeAddr, bridge.PairingToken())
 		if err := bridgeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()
 
 	go func() {
-		log.Printf("rcc-relay listening on http://%s", *relayAddr)
+		log.Printf("Recodex Relay 已启动: http://%s", *relayAddr)
+		serverlog.RelayStartup(*relayAddr)
 		if err := relayServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}

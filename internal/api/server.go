@@ -22,6 +22,7 @@ import (
 	"recodex-go/internal/config"
 	"recodex-go/internal/gitops"
 	"recodex-go/internal/session"
+	"recodex-go/internal/web"
 	"recodex-go/internal/workspace"
 )
 
@@ -85,25 +86,34 @@ func (s *Server) refreshPairingToken() string {
 }
 
 func (s *Server) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /version", s.version)
-	mux.HandleFunc("GET /pairing", s.pairing)
-	mux.HandleFunc("GET /context", s.context)
-	mux.HandleFunc("GET /workspaces", s.workspaceList)
-	mux.HandleFunc("GET /devices", s.deviceList)
-	mux.HandleFunc("DELETE /devices/{id}", s.deviceRevoke)
-	mux.HandleFunc("GET /sessions", s.sessionList)
-	mux.HandleFunc("POST /sessions/start", s.sessionStart)
-	mux.HandleFunc("GET /sessions/{id}/events", s.sessionEvents)
-	mux.HandleFunc("POST /sessions/{id}/interrupt", s.sessionInterrupt)
-	mux.HandleFunc("GET /git/status", s.gitStatus)
-	mux.HandleFunc("GET /git/diff", s.gitDiff)
-	mux.HandleFunc("POST /git/commit", s.gitCommit)
-	mux.HandleFunc("POST /git/push", s.gitPush)
-	mux.HandleFunc("POST /git/undo", s.gitUndo)
-	mux.HandleFunc("/ws", s.ws)
-	return withCORS(mux)
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("GET /healthz", s.health)
+	apiMux.HandleFunc("GET /version", s.version)
+	apiMux.HandleFunc("GET /pairing", s.pairing)
+	apiMux.HandleFunc("GET /context", s.context)
+	apiMux.HandleFunc("GET /workspaces", s.workspaceList)
+	apiMux.HandleFunc("GET /devices", s.deviceList)
+	apiMux.HandleFunc("DELETE /devices/{id}", s.deviceRevoke)
+	apiMux.HandleFunc("GET /sessions", s.sessionList)
+	apiMux.HandleFunc("POST /sessions/start", s.sessionStart)
+	apiMux.HandleFunc("GET /sessions/{id}/events", s.sessionEvents)
+	apiMux.HandleFunc("POST /sessions/{id}/interrupt", s.sessionInterrupt)
+	apiMux.HandleFunc("GET /git/status", s.gitStatus)
+	apiMux.HandleFunc("GET /git/diff", s.gitDiff)
+	apiMux.HandleFunc("POST /git/commit", s.gitCommit)
+	apiMux.HandleFunc("POST /git/push", s.gitPush)
+	apiMux.HandleFunc("POST /git/undo", s.gitUndo)
+	apiMux.HandleFunc("/ws", s.ws)
+
+	webHandler := web.Handler()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.StripPrefix("/api", apiMux).ServeHTTP(w, r)
+			return
+		}
+		webHandler.ServeHTTP(w, r)
+	})
+	return withCORS(handler)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -343,7 +353,7 @@ func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 		"host":           host,
 		"lanHost":        lanHost,
 		"baseUrl":        baseURL,
-		"wsUrl":          "ws://" + host + "/ws",
+		"wsUrl":          "ws://" + host + "/api/ws",
 		"token":          token,
 		"pairingUri":     pairingURI.String(),
 		"pairingEnabled": s.cfg.Security.PairingEnabled && token != "",

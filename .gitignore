@@ -30,3 +30,7 @@ bin/
 .DS_Store
 .vscode
 .idea
+
+web/dist/
+web/recodex-web/
+/internal/web/recodex-web/
