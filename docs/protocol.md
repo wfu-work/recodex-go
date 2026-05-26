@@ -25,6 +25,7 @@ All WebSocket messages are JSON envelopes:
 - `POST /git/commit`
 - `POST /git/push`
 - `POST /git/undo`
+- `GET /relay`
 
 These HTTP endpoints are available without WebSocket authentication for the bundled local web console. Git write endpoints still honor `security.require_confirm_for_git_write` and return `confirm.required`-style payloads when confirmation is required.
 
@@ -91,7 +92,15 @@ The bridge returns `auth.ok` with `deviceKey`. The app stores that key and uses 
 Relay connections use:
 
 ```text
-ws://<relay-host>:8787/relay/<room>
+ws://<relay-host>/relay/<roomId>?clientId=...&clientType=bridge|app&timestamp=...&nonce=...&signature=...
 ```
 
-The relay forwards opaque messages between peers in the same room. Encryption and higher-level authentication are owned by Bridge/App messages, not by the relay.
+For `relay-go`, the signature payload is:
+
+```text
+clientId + "\n" + clientType + "\n" + roomId + "\n" + timestamp + "\n" + nonce
+```
+
+The signature is `hex(hmac_sha256(clientSecret, signPayload))`.
+
+The Recodex Bridge joins the configured room as `clientType=bridge` and continues to handle the same Recodex JSON envelopes after the relay connection is established. App clients must join the same `roomId` with an `app` client credential, then send `auth.hello` and the normal bridge messages through the relay. The relay forwards opaque messages between peers in the same room and does not wrap business messages.

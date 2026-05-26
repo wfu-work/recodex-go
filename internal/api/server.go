@@ -21,6 +21,8 @@ import (
 	"recodex-go/internal/codex"
 	"recodex-go/internal/config"
 	"recodex-go/internal/gitops"
+	"recodex-go/internal/relayclient"
+	"recodex-go/internal/relaysettings"
 	"recodex-go/internal/session"
 	"recodex-go/internal/web"
 	"recodex-go/internal/workspace"
@@ -36,6 +38,9 @@ type Server struct {
 	pairingToken string
 	pairingUntil time.Time
 	upgrader     websocket.Upgrader
+	relayMu      sync.Mutex
+	relayRoot    context.Context
+	relayCancel  context.CancelFunc
 }
 
 type Envelope struct {
@@ -45,6 +50,11 @@ type Envelope struct {
 }
 
 func NewServer(cfg config.Config) (*Server, error) {
+	if relayCfg, ok, err := relaysettings.Load(cfg.State.Dir); err != nil {
+		return nil, err
+	} else if ok {
+		cfg.Relay = normalizeRelayConfig(relayCfg)
+	}
 	devices, err := auth.NewStore(cfg.State.Dir)
 	if err != nil {
 		return nil, err
@@ -89,6 +99,8 @@ func (s *Server) Routes() http.Handler {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /healthz", s.health)
 	apiMux.HandleFunc("GET /version", s.version)
+	apiMux.HandleFunc("GET /relay", s.relayGet)
+	apiMux.HandleFunc("PUT /relay", s.relayPut)
 	apiMux.HandleFunc("GET /pairing", s.pairing)
 	apiMux.HandleFunc("GET /context", s.context)
 	apiMux.HandleFunc("GET /workspaces", s.workspaceList)
@@ -122,6 +134,152 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"name": "rcc-bridge", "version": Version})
+}
+
+func (s *Server) relayGet(w http.ResponseWriter, _ *http.Request) {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	writeJSON(w, http.StatusOK, relayConfigPayload(s.cfg.Relay))
+}
+
+func (s *Server) relayPut(w http.ResponseWriter, r *http.Request) {
+	var payload relayUpdatePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
+		return
+	}
+
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	next := payload.toConfig(s.cfg.Relay)
+	if err := validateRelayConfig(next); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "relay_config_invalid", "message": err.Error()})
+		return
+	}
+	if err := relaysettings.Save(s.cfg.State.Dir, next); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": "relay_config_save_failed", "message": err.Error()})
+		return
+	}
+	s.cfg.Relay = next
+	if err := s.restartRelayLocked(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "relay_restart_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, relayConfigPayload(s.cfg.Relay))
+}
+
+type relayUpdatePayload struct {
+	Enabled          bool   `json:"enabled"`
+	URL              string `json:"url"`
+	PublicURL        string `json:"publicUrl"`
+	RoomID           string `json:"roomId"`
+	RoomToken        string `json:"roomToken"`
+	AccountGuid      string `json:"accountGuid"`
+	ClientID         string `json:"clientId"`
+	ClientSecret     string `json:"clientSecret"`
+	ClientType       string `json:"clientType"`
+	TargetClientID   string `json:"targetClientId"`
+	ReconnectSeconds int    `json:"reconnectSeconds"`
+}
+
+func (p relayUpdatePayload) toConfig(current config.RelayConfig) config.RelayConfig {
+	clientSecret := strings.TrimSpace(p.ClientSecret)
+	if clientSecret == "" {
+		clientSecret = current.ClientSecret
+	}
+	return normalizeRelayConfig(config.RelayConfig{
+		Enabled:          p.Enabled,
+		URL:              strings.TrimSpace(p.URL),
+		PublicURL:        strings.TrimSpace(p.PublicURL),
+		RoomID:           strings.Trim(strings.TrimSpace(p.RoomID), "/"),
+		RoomToken:        strings.TrimSpace(p.RoomToken),
+		AccountGuid:      strings.TrimSpace(p.AccountGuid),
+		ClientID:         strings.TrimSpace(p.ClientID),
+		ClientSecret:     clientSecret,
+		ClientType:       strings.TrimSpace(p.ClientType),
+		TargetClientID:   strings.TrimSpace(p.TargetClientID),
+		ReconnectSeconds: p.ReconnectSeconds,
+	})
+}
+
+func relayConfigPayload(cfg config.RelayConfig) map[string]any {
+	cfg = normalizeRelayConfig(cfg)
+	return map[string]any{
+		"enabled":                cfg.Enabled,
+		"url":                    cfg.URL,
+		"publicUrl":              cfg.PublicURL,
+		"roomId":                 cfg.RoomID,
+		"roomTokenConfigured":    cfg.RoomToken != "",
+		"accountGuid":            cfg.AccountGuid,
+		"clientId":               cfg.ClientID,
+		"clientSecretConfigured": cfg.ClientSecret != "",
+		"clientType":             cfg.ClientType,
+		"targetClientId":         cfg.TargetClientID,
+		"reconnectSeconds":       cfg.ReconnectSeconds,
+	}
+}
+
+func validateRelayConfig(cfg config.RelayConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if err := validateRelayURL("relay.url", cfg.URL); err != nil {
+		return err
+	}
+	if cfg.PublicURL != "" {
+		if err := validateRelayURL("relay.public_url", cfg.PublicURL); err != nil {
+			return err
+		}
+	}
+	if cfg.RoomID == "" {
+		return errors.New("relay.room_id is required")
+	}
+	if cfg.ClientID == "" {
+		return errors.New("relay.client_id is required")
+	}
+	if cfg.ClientSecret == "" {
+		return errors.New("relay.client_secret is required")
+	}
+	if cfg.ClientType != "bridge" {
+		return errors.New("relay.client_type must be bridge")
+	}
+	if cfg.ReconnectSeconds < 1 {
+		return errors.New("relay.reconnect_seconds must be greater than 0")
+	}
+	return nil
+}
+
+func validateRelayURL(name, raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
+		return errors.New(name + " must use ws or wss scheme")
+	}
+	if parsed.Host == "" {
+		return errors.New(name + " host is required")
+	}
+	return nil
+}
+
+func normalizeRelayConfig(cfg config.RelayConfig) config.RelayConfig {
+	cfg.URL = strings.TrimSpace(cfg.URL)
+	cfg.PublicURL = strings.TrimSpace(cfg.PublicURL)
+	cfg.RoomID = strings.Trim(strings.TrimSpace(cfg.RoomID), "/")
+	cfg.RoomToken = strings.TrimSpace(cfg.RoomToken)
+	cfg.AccountGuid = strings.TrimSpace(cfg.AccountGuid)
+	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
+	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
+	cfg.ClientType = strings.TrimSpace(cfg.ClientType)
+	if cfg.ClientType == "" {
+		cfg.ClientType = "bridge"
+	}
+	cfg.TargetClientID = strings.TrimSpace(cfg.TargetClientID)
+	if cfg.ReconnectSeconds <= 0 {
+		cfg.ReconnectSeconds = 5
+	}
+	return cfg
 }
 
 func (s *Server) context(w http.ResponseWriter, _ *http.Request) {
@@ -293,7 +451,14 @@ func (s *Server) contextPayload(workspacePath string) map[string]any {
 		"codexVersion":           s.codexVersion(),
 		"apiKeyConfigured":       apiKeyConfigured(),
 		"usage":                  s.sessions.UsageSummary(usageRatePer1KTokens()),
+		"relay":                  s.publicRelayConfig(),
 	}
+}
+
+func (s *Server) publicRelayConfig() map[string]any {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	return relayclient.PublicConfig(s.cfg.Relay)
 }
 
 func (s *Server) codexVersion() string {
@@ -358,6 +523,7 @@ func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 		"pairingUri":     pairingURI.String(),
 		"pairingEnabled": s.cfg.Security.PairingEnabled && token != "",
 		"expiresAt":      s.pairingUntil,
+		"relay":          s.publicRelayConfig(),
 	})
 }
 
@@ -368,6 +534,39 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 	}
 	client := &wsClient{server: s, conn: conn}
 	client.run(r.Context())
+}
+
+func (s *Server) RunRelayClient(ctx context.Context) error {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	s.relayRoot = ctx
+	return s.restartRelayLocked()
+}
+
+func (s *Server) restartRelayLocked() error {
+	if s.relayCancel != nil {
+		s.relayCancel()
+		s.relayCancel = nil
+	}
+	if !s.cfg.Relay.Enabled {
+		return nil
+	}
+	root := s.relayRoot
+	if root == nil {
+		root = context.Background()
+	}
+	relayCtx, cancel := context.WithCancel(root)
+	client, err := relayclient.New(s.cfg.Relay, func(connCtx context.Context, conn *websocket.Conn) {
+		wsClient := &wsClient{server: s, conn: conn}
+		wsClient.run(connCtx)
+	})
+	if err != nil {
+		cancel()
+		return err
+	}
+	s.relayCancel = cancel
+	go client.Run(relayCtx)
+	return nil
 }
 
 type wsClient struct {
@@ -388,6 +587,9 @@ func (c *wsClient) run(ctx context.Context) {
 		var env Envelope
 		if err := c.conn.ReadJSON(&env); err != nil {
 			return
+		}
+		if strings.HasPrefix(env.Type, "relay.") {
+			continue
 		}
 		if env.Type != "auth.hello" && !c.authed {
 			_ = c.writeError(env.ID, "auth_required", "send auth.hello first")
@@ -710,7 +912,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

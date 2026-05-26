@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -8,13 +9,11 @@ import (
 
 	"recodex-go/internal/api"
 	"recodex-go/internal/config"
-	"recodex-go/internal/relay"
 	"recodex-go/internal/serverlog"
 )
 
 func main() {
-	configPath := flag.String("config", "bridge.yaml", "path to bridge YAML config")
-	relayAddr := flag.String("relay-addr", "127.0.0.1:8787", "relay listen address")
+	configPath := flag.String("config", "config.yaml", "path to bridge YAML config")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -26,43 +25,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("create bridge server: %v", err)
 	}
+	if err := bridge.RunRelayClient(context.Background()); err != nil {
+		log.Fatalf("start relay client: %v", err)
+	}
 
-	bridgeAddr := cfg.Server.Address()
-	bridgeServer := &http.Server{
-		Addr:              bridgeAddr,
+	addr := cfg.Server.Address()
+	httpServer := &http.Server{
+		Addr:              addr,
 		Handler:           bridge.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	relayMux := http.NewServeMux()
-	relayHub := relay.NewHub()
-	relayMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"name":"rcc-relay"}`))
-	})
-	relayMux.HandleFunc("/relay/", relayHub.HandleWebSocket)
-	relayServer := &http.Server{
-		Addr:              *relayAddr,
-		Handler:           relayMux,
-		ReadHeaderTimeout: 10 * time.Second,
+	log.Printf("Recodex Bridge 已启动: http://%s", addr)
+	serverlog.BridgeStartup(addr, bridge.PairingToken())
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("serve: %v", err)
 	}
-
-	errCh := make(chan error, 2)
-	go func() {
-		log.Printf("Recodex Bridge 已启动: http://%s", bridgeAddr)
-		serverlog.BridgeStartup(bridgeAddr, bridge.PairingToken())
-		if err := bridgeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
-		}
-	}()
-
-	go func() {
-		log.Printf("Recodex Relay 已启动: http://%s", *relayAddr)
-		serverlog.RelayStartup(*relayAddr)
-		if err := relayServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
-		}
-	}()
-
-	log.Fatalf("serve: %v", <-errCh)
 }

@@ -1,6 +1,5 @@
 APP := recodex
 BRIDGE := rcc-bridge
-RELAY := rcc-relay
 BIN_DIR := bin
 CACHE_DIR := .cache
 GOCACHE := $(CURDIR)/$(CACHE_DIR)/go-build
@@ -8,7 +7,7 @@ GOCACHE := $(CURDIR)/$(CACHE_DIR)/go-build
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build bridge relay test fmt clean
+.PHONY: all build bridge test fmt clean
 
 all: test build
 
@@ -19,10 +18,6 @@ build:
 bridge:
 	@mkdir -p $(BIN_DIR) $(GOCACHE)
 	GOCACHE=$(GOCACHE) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BIN_DIR)/$(BRIDGE) ./cmd/rcc-bridge
-
-relay:
-	@mkdir -p $(BIN_DIR) $(GOCACHE)
-	GOCACHE=$(GOCACHE) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BIN_DIR)/$(RELAY) ./cmd/rcc-relay
 
 test:
 	@mkdir -p $(GOCACHE)

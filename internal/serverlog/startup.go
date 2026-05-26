@@ -17,12 +17,6 @@ func BridgeStartup(addr string, pairingToken string) {
 	log.Printf("Recodex 配对 Token: %s", pairingToken)
 }
 
-func RelayStartup(addr string) {
-	baseURL := publicBaseURL(addr)
-	log.Printf("Recodex Relay 地址: %s", baseURL)
-	log.Printf("Recodex Relay WebSocket 地址: %s/relay/", wsBaseURL(addr))
-}
-
 func publicBaseURL(addr string) string {
 	return "http://" + publicAddr(addr)
 }

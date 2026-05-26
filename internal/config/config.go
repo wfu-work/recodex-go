@@ -14,6 +14,7 @@ import (
 type Config struct {
 	Server     ServerConfig      `yaml:"server" json:"server"`
 	Codex      CodexConfig       `yaml:"codex" json:"codex"`
+	Relay      RelayConfig       `yaml:"relay" json:"relay"`
 	Workspaces []WorkspaceConfig `yaml:"workspaces" json:"workspaces"`
 	Security   SecurityConfig    `yaml:"security" json:"security"`
 	State      StateConfig       `yaml:"state" json:"state"`
@@ -39,6 +40,20 @@ type CodexConfig struct {
 type WorkspaceConfig struct {
 	Name string `yaml:"name" json:"name"`
 	Path string `yaml:"path" json:"path"`
+}
+
+type RelayConfig struct {
+	Enabled          bool   `yaml:"enabled" json:"enabled"`
+	URL              string `yaml:"url" json:"url"`
+	PublicURL        string `yaml:"public_url" json:"publicUrl"`
+	RoomID           string `yaml:"room_id" json:"roomId"`
+	RoomToken        string `yaml:"room_token" json:"-"`
+	AccountGuid      string `yaml:"account_guid" json:"accountGuid"`
+	ClientID         string `yaml:"client_id" json:"clientId"`
+	ClientSecret     string `yaml:"client_secret" json:"-"`
+	ClientType       string `yaml:"client_type" json:"clientType"`
+	TargetClientID   string `yaml:"target_client_id" json:"targetClientId"`
+	ReconnectSeconds int    `yaml:"reconnect_seconds" json:"reconnectSeconds"`
 }
 
 type SecurityConfig struct {
@@ -116,6 +131,12 @@ func normalize(cfg *Config, baseDir string) error {
 	}
 	if cfg.Codex.ReasoningEffort == "" {
 		cfg.Codex.ReasoningEffort = "medium"
+	}
+	if cfg.Relay.ClientType == "" {
+		cfg.Relay.ClientType = "bridge"
+	}
+	if cfg.Relay.ReconnectSeconds == 0 {
+		cfg.Relay.ReconnectSeconds = 5
 	}
 	if cfg.Security.PairingTTLSeconds == 0 {
 		cfg.Security.PairingTTLSeconds = 300

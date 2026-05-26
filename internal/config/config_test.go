@@ -24,7 +24,7 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 
 func TestLoadResolvesStateDirRelativeToConfigFile(t *testing.T) {
 	root := t.TempDir()
-	configPath := filepath.Join(root, "bridge.yaml")
+	configPath := filepath.Join(root, "config.yaml")
 	raw := []byte("state:\n  dir: .recodex\n")
 	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)

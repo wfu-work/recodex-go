@@ -8,6 +8,7 @@
 - Authorized devices can be listed and revoked over authenticated WebSocket messages.
 - Git write operations require an explicit `confirm: true` payload.
 - Commands use `exec.CommandContext` with argument arrays rather than shell strings.
-- Relay only forwards opaque WebSocket payloads and does not persist business data.
+- Remote Relay should only forward opaque WebSocket payloads. Recodex authentication and authorization remain owned by Bridge/App.
+- Prefer `wss://` for remote Relay URLs outside local development.
 
 For LAN usage, change `server.host` to `0.0.0.0`, restart the bridge, and pair again from the mobile app.

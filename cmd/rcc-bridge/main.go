@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "bridge.yaml", "path to bridge YAML config")
+	configPath := flag.String("config", "config.yaml", "path to bridge YAML config")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -23,6 +24,9 @@ func main() {
 	server, err := api.NewServer(cfg)
 	if err != nil {
 		log.Fatalf("create server: %v", err)
+	}
+	if err := server.RunRelayClient(context.Background()); err != nil {
+		log.Fatalf("start relay client: %v", err)
 	}
 
 	addr := cfg.Server.Address()
