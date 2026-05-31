@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 
@@ -124,6 +125,8 @@ func SignedURL(cfg config.RelayConfig, now time.Time) (string, error) {
 	query.Set("timestamp", timestamp)
 	query.Set("nonce", nonce)
 	query.Set("signature", signature)
+	query.Set("platform", clientPlatform())
+	query.Set("version", clientVersion())
 	if target := strings.TrimSpace(cfg.TargetClientID); target != "" {
 		query.Set("targetClientId", target)
 	}
@@ -132,6 +135,14 @@ func SignedURL(cfg config.RelayConfig, now time.Time) (string, error) {
 	}
 	base.RawQuery = query.Encode()
 	return base.String(), nil
+}
+
+func clientPlatform() string {
+	return runtime.GOOS + "/" + runtime.GOARCH
+}
+
+func clientVersion() string {
+	return "recodex-go/0.1.0"
 }
 
 func Sign(secret, clientID, clientType, roomID, timestamp, nonce string) string {

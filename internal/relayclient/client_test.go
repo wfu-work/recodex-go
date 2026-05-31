@@ -56,6 +56,12 @@ func TestSignedURLBuildsRelayQuery(t *testing.T) {
 	if values.Get("roomToken") != "room-token" {
 		t.Fatalf("unexpected roomToken: %s", values.Get("roomToken"))
 	}
+	if values.Get("platform") == "" {
+		t.Fatal("platform should be set")
+	}
+	if values.Get("version") != "recodex-go/0.1.0" {
+		t.Fatalf("unexpected version: %s", values.Get("version"))
+	}
 }
 
 func TestPublicConfigUsesPublicURLAndHidesSecrets(t *testing.T) {
