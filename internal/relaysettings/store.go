@@ -17,7 +17,6 @@ type storedConfig struct {
 	PublicURL        string `json:"publicUrl"`
 	RoomID           string `json:"roomId"`
 	RoomToken        string `json:"roomToken,omitempty"`
-	AccountGuid      string `json:"accountGuid"`
 	ClientID         string `json:"clientId"`
 	ClientSecret     string `json:"clientSecret,omitempty"`
 	ClientType       string `json:"clientType"`
@@ -62,7 +61,6 @@ func toStored(cfg config.RelayConfig) storedConfig {
 		PublicURL:        cfg.PublicURL,
 		RoomID:           cfg.RoomID,
 		RoomToken:        cfg.RoomToken,
-		AccountGuid:      cfg.AccountGuid,
 		ClientID:         cfg.ClientID,
 		ClientSecret:     cfg.ClientSecret,
 		ClientType:       cfg.ClientType,
@@ -78,7 +76,6 @@ func fromStored(stored storedConfig) config.RelayConfig {
 		PublicURL:        stored.PublicURL,
 		RoomID:           stored.RoomID,
 		RoomToken:        stored.RoomToken,
-		AccountGuid:      stored.AccountGuid,
 		ClientID:         stored.ClientID,
 		ClientSecret:     stored.ClientSecret,
 		ClientType:       stored.ClientType,

@@ -160,7 +160,6 @@ func PublicConfig(cfg config.RelayConfig) map[string]any {
 		"enabled":        true,
 		"url":            publicURL(cfg),
 		"roomId":         strings.TrimSpace(cfg.RoomID),
-		"accountGuid":    strings.TrimSpace(cfg.AccountGuid),
 		"clientId":       strings.TrimSpace(cfg.ClientID),
 		"clientType":     strings.TrimSpace(cfg.ClientType),
 		"targetClientId": strings.TrimSpace(cfg.TargetClientID),

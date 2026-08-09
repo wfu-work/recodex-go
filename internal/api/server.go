@@ -174,7 +174,6 @@ type relayUpdatePayload struct {
 	PublicURL        string `json:"publicUrl"`
 	RoomID           string `json:"roomId"`
 	RoomToken        string `json:"roomToken"`
-	AccountGuid      string `json:"accountGuid"`
 	ClientID         string `json:"clientId"`
 	ClientSecret     string `json:"clientSecret"`
 	ClientType       string `json:"clientType"`
@@ -193,7 +192,6 @@ func (p relayUpdatePayload) toConfig(current config.RelayConfig) config.RelayCon
 		PublicURL:        strings.TrimSpace(p.PublicURL),
 		RoomID:           strings.Trim(strings.TrimSpace(p.RoomID), "/"),
 		RoomToken:        strings.TrimSpace(p.RoomToken),
-		AccountGuid:      strings.TrimSpace(p.AccountGuid),
 		ClientID:         strings.TrimSpace(p.ClientID),
 		ClientSecret:     clientSecret,
 		ClientType:       strings.TrimSpace(p.ClientType),
@@ -210,7 +208,6 @@ func relayConfigPayload(cfg config.RelayConfig) map[string]any {
 		"publicUrl":              cfg.PublicURL,
 		"roomId":                 cfg.RoomID,
 		"roomTokenConfigured":    cfg.RoomToken != "",
-		"accountGuid":            cfg.AccountGuid,
 		"clientId":               cfg.ClientID,
 		"clientSecretConfigured": cfg.ClientSecret != "",
 		"clientType":             cfg.ClientType,
@@ -268,7 +265,6 @@ func normalizeRelayConfig(cfg config.RelayConfig) config.RelayConfig {
 	cfg.PublicURL = strings.TrimSpace(cfg.PublicURL)
 	cfg.RoomID = strings.Trim(strings.TrimSpace(cfg.RoomID), "/")
 	cfg.RoomToken = strings.TrimSpace(cfg.RoomToken)
-	cfg.AccountGuid = strings.TrimSpace(cfg.AccountGuid)
 	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
 	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
 	cfg.ClientType = strings.TrimSpace(cfg.ClientType)

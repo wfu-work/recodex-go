@@ -48,7 +48,6 @@ type RelayConfig struct {
 	PublicURL        string `yaml:"public_url" json:"publicUrl"`
 	RoomID           string `yaml:"room_id" json:"roomId"`
 	RoomToken        string `yaml:"room_token" json:"-"`
-	AccountGuid      string `yaml:"account_guid" json:"accountGuid"`
 	ClientID         string `yaml:"client_id" json:"clientId"`
 	ClientSecret     string `yaml:"client_secret" json:"-"`
 	ClientType       string `yaml:"client_type" json:"clientType"`
