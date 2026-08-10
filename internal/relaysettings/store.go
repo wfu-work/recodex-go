@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"recodex-go/internal/config"
+	"recodex-go/internal/statefile"
 )
 
 const filename = "relay.json"
@@ -47,7 +48,7 @@ func Save(stateDir string, cfg config.RelayConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path(stateDir), raw, 0o600)
+	return statefile.WriteFile(path(stateDir), raw, 0o600)
 }
 
 func path(stateDir string) string {

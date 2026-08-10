@@ -2,10 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,23 +25,35 @@ import (
 	"recodex-go/internal/relayclient"
 	"recodex-go/internal/relaysettings"
 	"recodex-go/internal/session"
+	"recodex-go/internal/version"
 	"recodex-go/internal/web"
 	"recodex-go/internal/workspace"
 )
 
-const Version = "0.1.0"
+const (
+	maxJSONBodyBytes  = 1 << 20
+	maxWSMessageBytes = 1 << 20
+	wsAuthTimeout     = 10 * time.Second
+	wsWriteTimeout    = 10 * time.Second
+	wsPongTimeout     = 60 * time.Second
+	wsPingInterval    = 30 * time.Second
+)
 
 type Server struct {
-	cfg          config.Config
-	devices      *auth.Store
-	sessions     *session.Manager
-	workspaces   workspace.Registry
-	pairingToken string
-	pairingUntil time.Time
-	upgrader     websocket.Upgrader
-	relayMu      sync.Mutex
-	relayRoot    context.Context
-	relayCancel  context.CancelFunc
+	cfg               config.Config
+	devices           *auth.Store
+	sessions          *session.Manager
+	workspaces        workspace.Registry
+	root              context.Context
+	rootCancel        context.CancelFunc
+	pairingMu         sync.Mutex
+	pairingToken      string
+	pairingUntil      time.Time
+	codexVersionValue string
+	upgrader          websocket.Upgrader
+	relayMu           sync.Mutex
+	relayRoot         context.Context
+	relayCancel       context.CancelFunc
 }
 
 type Envelope struct {
@@ -50,33 +63,51 @@ type Envelope struct {
 }
 
 func NewServer(cfg config.Config) (*Server, error) {
+	root, rootCancel := context.WithCancel(context.Background())
 	if relayCfg, ok, err := relaysettings.Load(cfg.State.Dir); err != nil {
+		rootCancel()
 		return nil, err
 	} else if ok {
 		cfg.Relay = normalizeRelayConfig(relayCfg)
+		if err := validateRelayConfig(cfg.Relay); err != nil {
+			rootCancel()
+			return nil, fmt.Errorf("validate persisted relay config: %w", err)
+		}
 	}
 	devices, err := auth.NewStore(cfg.State.Dir)
 	if err != nil {
+		rootCancel()
 		return nil, err
 	}
-	manager, err := session.NewManager(cfg.State.Dir, codex.NewCLIAdapter(cfg.Codex))
+	manager, err := session.NewManager(root, cfg.State.Dir, codex.NewCLIAdapter(cfg.Codex), cfg.Workspaces)
 	if err != nil {
+		rootCancel()
 		return nil, err
 	}
-	return &Server{
+	server := &Server{
 		cfg:          cfg,
 		devices:      devices,
 		sessions:     manager,
 		workspaces:   workspace.NewRegistry(cfg.Workspaces),
+		root:         root,
+		rootCancel:   rootCancel,
 		pairingToken: auth.RandomToken(18),
 		pairingUntil: time.Now().Add(time.Duration(cfg.Security.PairingTTLSeconds) * time.Second),
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin: websocketOriginAllowed,
 		},
-	}, nil
+	}
+	server.codexVersionValue = server.readCodexVersion()
+	return server, nil
 }
 
 func (s *Server) PairingToken() string {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+	return s.pairingTokenLocked()
+}
+
+func (s *Server) pairingTokenLocked() string {
 	if !s.cfg.Security.PairingEnabled || time.Now().After(s.pairingUntil) {
 		return ""
 	}
@@ -84,10 +115,12 @@ func (s *Server) PairingToken() string {
 }
 
 func (s *Server) refreshPairingToken() string {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
 	if !s.cfg.Security.PairingEnabled {
 		return ""
 	}
-	if token := s.PairingToken(); token != "" {
+	if token := s.pairingTokenLocked(); token != "" {
 		return token
 	}
 	s.pairingToken = auth.RandomToken(18)
@@ -95,26 +128,47 @@ func (s *Server) refreshPairingToken() string {
 	return s.pairingToken
 }
 
+func (s *Server) pairDevice(token, id, name string) (auth.Device, error) {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+	currentToken := s.pairingTokenLocked()
+	if token == "" || currentToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(currentToken)) != 1 {
+		return auth.Device{}, errors.New("device is not authorized")
+	}
+	device, err := s.devices.Pair(id, name)
+	if err != nil {
+		return auth.Device{}, err
+	}
+	// Pairing tokens are single-use. A fresh token is available locally for a
+	// subsequent device without extending the old token's lifetime.
+	s.pairingToken = auth.RandomToken(18)
+	s.pairingUntil = time.Now().Add(time.Duration(s.cfg.Security.PairingTTLSeconds) * time.Second)
+	return device, nil
+}
+
 func (s *Server) Routes() http.Handler {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /healthz", s.health)
 	apiMux.HandleFunc("GET /version", s.version)
-	apiMux.HandleFunc("GET /relay", s.relayGet)
-	apiMux.HandleFunc("PUT /relay", s.relayPut)
-	apiMux.HandleFunc("GET /pairing", s.pairing)
-	apiMux.HandleFunc("GET /context", s.context)
-	apiMux.HandleFunc("GET /workspaces", s.workspaceList)
-	apiMux.HandleFunc("GET /devices", s.deviceList)
-	apiMux.HandleFunc("DELETE /devices/{id}", s.deviceRevoke)
-	apiMux.HandleFunc("GET /sessions", s.sessionList)
-	apiMux.HandleFunc("POST /sessions/start", s.sessionStart)
-	apiMux.HandleFunc("GET /sessions/{id}/events", s.sessionEvents)
-	apiMux.HandleFunc("POST /sessions/{id}/interrupt", s.sessionInterrupt)
-	apiMux.HandleFunc("GET /git/status", s.gitStatus)
-	apiMux.HandleFunc("GET /git/diff", s.gitDiff)
-	apiMux.HandleFunc("POST /git/commit", s.gitCommit)
-	apiMux.HandleFunc("POST /git/push", s.gitPush)
-	apiMux.HandleFunc("POST /git/undo", s.gitUndo)
+	local := func(pattern string, handler http.HandlerFunc) {
+		apiMux.Handle(pattern, localOnly(handler))
+	}
+	local("GET /relay", s.relayGet)
+	local("PUT /relay", s.relayPut)
+	local("GET /pairing", s.pairing)
+	local("GET /context", s.context)
+	local("GET /workspaces", s.workspaceList)
+	local("GET /devices", s.deviceList)
+	local("DELETE /devices/{id}", s.deviceRevoke)
+	local("GET /sessions", s.sessionList)
+	local("POST /sessions/start", s.sessionStart)
+	local("GET /sessions/{id}/events", s.sessionEvents)
+	local("POST /sessions/{id}/interrupt", s.sessionInterrupt)
+	local("GET /git/status", s.gitStatus)
+	local("GET /git/diff", s.gitDiff)
+	local("POST /git/commit", s.gitCommit)
+	local("POST /git/push", s.gitPush)
+	local("POST /git/undo", s.gitUndo)
 	apiMux.HandleFunc("/ws", s.ws)
 
 	webHandler := web.Handler()
@@ -129,153 +183,11 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": Version})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": version.Value})
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"name": "rcc-bridge", "version": Version})
-}
-
-func (s *Server) relayGet(w http.ResponseWriter, _ *http.Request) {
-	s.relayMu.Lock()
-	defer s.relayMu.Unlock()
-	writeJSON(w, http.StatusOK, relayConfigPayload(s.cfg.Relay))
-}
-
-func (s *Server) relayPut(w http.ResponseWriter, r *http.Request) {
-	var payload relayUpdatePayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
-		return
-	}
-
-	s.relayMu.Lock()
-	defer s.relayMu.Unlock()
-	next := payload.toConfig(s.cfg.Relay)
-	if err := validateRelayConfig(next); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "relay_config_invalid", "message": err.Error()})
-		return
-	}
-	if err := relaysettings.Save(s.cfg.State.Dir, next); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": "relay_config_save_failed", "message": err.Error()})
-		return
-	}
-	s.cfg.Relay = next
-	if err := s.restartRelayLocked(); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "relay_restart_failed", "message": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, relayConfigPayload(s.cfg.Relay))
-}
-
-type relayUpdatePayload struct {
-	Enabled          bool   `json:"enabled"`
-	URL              string `json:"url"`
-	PublicURL        string `json:"publicUrl"`
-	RoomID           string `json:"roomId"`
-	RoomToken        string `json:"roomToken"`
-	ClientID         string `json:"clientId"`
-	ClientSecret     string `json:"clientSecret"`
-	ClientType       string `json:"clientType"`
-	TargetClientID   string `json:"targetClientId"`
-	ReconnectSeconds int    `json:"reconnectSeconds"`
-}
-
-func (p relayUpdatePayload) toConfig(current config.RelayConfig) config.RelayConfig {
-	clientSecret := strings.TrimSpace(p.ClientSecret)
-	if clientSecret == "" {
-		clientSecret = current.ClientSecret
-	}
-	return normalizeRelayConfig(config.RelayConfig{
-		Enabled:          p.Enabled,
-		URL:              strings.TrimSpace(p.URL),
-		PublicURL:        strings.TrimSpace(p.PublicURL),
-		RoomID:           strings.Trim(strings.TrimSpace(p.RoomID), "/"),
-		RoomToken:        strings.TrimSpace(p.RoomToken),
-		ClientID:         strings.TrimSpace(p.ClientID),
-		ClientSecret:     clientSecret,
-		ClientType:       strings.TrimSpace(p.ClientType),
-		TargetClientID:   strings.TrimSpace(p.TargetClientID),
-		ReconnectSeconds: p.ReconnectSeconds,
-	})
-}
-
-func relayConfigPayload(cfg config.RelayConfig) map[string]any {
-	cfg = normalizeRelayConfig(cfg)
-	return map[string]any{
-		"enabled":                cfg.Enabled,
-		"url":                    cfg.URL,
-		"publicUrl":              cfg.PublicURL,
-		"roomId":                 cfg.RoomID,
-		"roomTokenConfigured":    cfg.RoomToken != "",
-		"clientId":               cfg.ClientID,
-		"clientSecretConfigured": cfg.ClientSecret != "",
-		"clientType":             cfg.ClientType,
-		"targetClientId":         cfg.TargetClientID,
-		"reconnectSeconds":       cfg.ReconnectSeconds,
-	}
-}
-
-func validateRelayConfig(cfg config.RelayConfig) error {
-	if !cfg.Enabled {
-		return nil
-	}
-	if err := validateRelayURL("relay.url", cfg.URL); err != nil {
-		return err
-	}
-	if cfg.PublicURL != "" {
-		if err := validateRelayURL("relay.public_url", cfg.PublicURL); err != nil {
-			return err
-		}
-	}
-	if cfg.RoomID == "" {
-		return errors.New("relay.room_id is required")
-	}
-	if cfg.ClientID == "" {
-		return errors.New("relay.client_id is required")
-	}
-	if cfg.ClientSecret == "" {
-		return errors.New("relay.client_secret is required")
-	}
-	if cfg.ClientType != "bridge" {
-		return errors.New("relay.client_type must be bridge")
-	}
-	if cfg.ReconnectSeconds < 1 {
-		return errors.New("relay.reconnect_seconds must be greater than 0")
-	}
-	return nil
-}
-
-func validateRelayURL(name, raw string) error {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return err
-	}
-	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
-		return errors.New(name + " must use ws or wss scheme")
-	}
-	if parsed.Host == "" {
-		return errors.New(name + " host is required")
-	}
-	return nil
-}
-
-func normalizeRelayConfig(cfg config.RelayConfig) config.RelayConfig {
-	cfg.URL = strings.TrimSpace(cfg.URL)
-	cfg.PublicURL = strings.TrimSpace(cfg.PublicURL)
-	cfg.RoomID = strings.Trim(strings.TrimSpace(cfg.RoomID), "/")
-	cfg.RoomToken = strings.TrimSpace(cfg.RoomToken)
-	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
-	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
-	cfg.ClientType = strings.TrimSpace(cfg.ClientType)
-	if cfg.ClientType == "" {
-		cfg.ClientType = "bridge"
-	}
-	cfg.TargetClientID = strings.TrimSpace(cfg.TargetClientID)
-	if cfg.ReconnectSeconds <= 0 {
-		cfg.ReconnectSeconds = 5
-	}
-	return cfg
+	writeJSON(w, http.StatusOK, map[string]any{"name": "rcc-bridge", "version": version.Value})
 }
 
 func (s *Server) context(w http.ResponseWriter, _ *http.Request) {
@@ -299,13 +211,15 @@ func (s *Server) deviceRevoke(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"deviceId": deviceID})
 }
 
-func (s *Server) sessionList(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": s.sessions.List()})
+func (s *Server) sessionList(w http.ResponseWriter, r *http.Request) {
+	limit, offset := listPagination(r.URL.Query().Get("limit"), r.URL.Query().Get("offset"))
+	records, nextOffset := s.sessions.ListPage(limit, offset)
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": records, "nextOffset": nextOffset})
 }
 
 func (s *Server) sessionStart(w http.ResponseWriter, r *http.Request) {
 	var payload sessionStartPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := decodeRequest(w, r, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
 		return
 	}
@@ -332,7 +246,8 @@ func (s *Server) sessionStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sessionEvents(w http.ResponseWriter, r *http.Request) {
-	events, err := s.sessions.Events(r.PathValue("id"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	events, err := s.sessions.EventsPage(r.PathValue("id"), limit)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"code": "session_events_failed", "message": err.Error()})
 		return
@@ -373,7 +288,7 @@ func (s *Server) gitSnapshot(w http.ResponseWriter, r *http.Request, includeDiff
 
 func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 	var payload gitWritePayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := decodeRequest(w, r, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
 		return
 	}
@@ -404,7 +319,7 @@ func (s *Server) gitUndo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) gitWrite(w http.ResponseWriter, r *http.Request, action, confirmMessage string, run func(context.Context, string) (string, error)) {
 	var payload gitWritePayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := decodeRequest(w, r, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_payload", "message": err.Error()})
 		return
 	}
@@ -428,8 +343,10 @@ func (s *Server) gitWrite(w http.ResponseWriter, r *http.Request, action, confir
 func (s *Server) contextPayload(workspacePath string) map[string]any {
 	branch := ""
 	if workspacePath != "" {
-		if snapshot, err := gitops.Snapshot(context.Background(), workspacePath, false); err == nil {
-			branch = snapshot.Branch
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if value, err := gitops.CurrentBranch(ctx, workspacePath); err == nil {
+			branch = value
 		}
 	}
 	return map[string]any{
@@ -437,14 +354,14 @@ func (s *Server) contextPayload(workspacePath string) map[string]any {
 		"model":                  s.cfg.Codex.Model,
 		"models":                 s.cfg.Codex.Models,
 		"reasoningEffort":        s.cfg.Codex.ReasoningEffort,
-		"reasoningEfforts":       []string{"low", "medium", "high", "xhigh"},
+		"reasoningEfforts":       []string{"minimal", "low", "medium", "high", "xhigh", "max", "ultra"},
 		"approvalPolicy":         "on-request",
 		"requireConfirmGitWrite": s.cfg.Security.RequireConfirmForGitWrite,
 		"branch":                 branch,
-		"version":                Version,
-		"bridgeVersion":          Version,
+		"version":                version.Value,
+		"bridgeVersion":          version.Value,
 		"codexBinary":            s.cfg.Codex.Binary,
-		"codexVersion":           s.codexVersion(),
+		"codexVersion":           s.codexVersionValue,
 		"apiKeyConfigured":       apiKeyConfigured(),
 		"usage":                  s.sessions.UsageSummary(usageRatePer1KTokens()),
 		"relay":                  s.publicRelayConfig(),
@@ -457,7 +374,7 @@ func (s *Server) publicRelayConfig() map[string]any {
 	return relayclient.PublicConfig(s.cfg.Relay)
 }
 
-func (s *Server) codexVersion() string {
+func (s *Server) readCodexVersion() string {
 	binary := s.cfg.Codex.Binary
 	if binary == "" {
 		binary = "codex"
@@ -486,7 +403,7 @@ func usageRatePer1KTokens() float64 {
 		return 0
 	}
 	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(value) || value < 0 {
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 		return 0
 	}
 	return value
@@ -494,11 +411,15 @@ func usageRatePer1KTokens() float64 {
 
 func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 	token := s.refreshPairingToken()
-	host := r.Host
-	if host == "" {
-		host = s.cfg.Server.Address()
+	host := pairingHost(r, s.cfg.Server)
+	scheme := "http"
+	wsScheme := "ws"
+	if r.TLS != nil {
+		scheme = "https"
+		wsScheme = "wss"
 	}
-	baseURL := "http://" + host
+	origin := scheme + "://" + host
+	baseURL := origin + "/api"
 	pairingURI := url.URL{
 		Scheme: "recodex",
 		Host:   "pair",
@@ -510,17 +431,23 @@ func (s *Server) pairing(w http.ResponseWriter, r *http.Request) {
 
 	lanHost := localIP()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":        Version,
+		"version":        version.Value,
 		"host":           host,
 		"lanHost":        lanHost,
 		"baseUrl":        baseURL,
-		"wsUrl":          "ws://" + host + "/api/ws",
+		"wsUrl":          wsScheme + "://" + host + "/api/ws",
 		"token":          token,
 		"pairingUri":     pairingURI.String(),
 		"pairingEnabled": s.cfg.Security.PairingEnabled && token != "",
-		"expiresAt":      s.pairingUntil,
+		"expiresAt":      s.pairingExpiry(),
 		"relay":          s.publicRelayConfig(),
 	})
+}
+
+func (s *Server) pairingExpiry() time.Time {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+	return s.pairingUntil
 }
 
 func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
@@ -529,7 +456,7 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := &wsClient{server: s, conn: conn}
-	client.run(r.Context())
+	client.run(s.root)
 }
 
 func (s *Server) RunRelayClient(ctx context.Context) error {
@@ -537,6 +464,21 @@ func (s *Server) RunRelayClient(ctx context.Context) error {
 	defer s.relayMu.Unlock()
 	s.relayRoot = ctx
 	return s.restartRelayLocked()
+}
+
+func (s *Server) Close() {
+	s.relayMu.Lock()
+	if s.relayCancel != nil {
+		s.relayCancel()
+		s.relayCancel = nil
+	}
+	s.relayMu.Unlock()
+	if s.rootCancel != nil {
+		s.rootCancel()
+	}
+	if s.sessions != nil {
+		s.sessions.Close()
+	}
 }
 
 func (s *Server) restartRelayLocked() error {
@@ -563,373 +505,4 @@ func (s *Server) restartRelayLocked() error {
 	s.relayCancel = cancel
 	go client.Run(relayCtx)
 	return nil
-}
-
-type wsClient struct {
-	server *Server
-	conn   *websocket.Conn
-	mu     sync.Mutex
-	authed bool
-}
-
-func (c *wsClient) run(ctx context.Context) {
-	defer c.conn.Close()
-	_ = c.write("bridge.hello", "", map[string]any{
-		"version": Version,
-		"pairing": c.server.PairingToken() != "",
-	})
-
-	for {
-		var env Envelope
-		if err := c.conn.ReadJSON(&env); err != nil {
-			return
-		}
-		if strings.HasPrefix(env.Type, "relay.") {
-			continue
-		}
-		if env.Type != "auth.hello" && !c.authed {
-			_ = c.writeError(env.ID, "auth_required", "send auth.hello first")
-			continue
-		}
-		c.handle(ctx, env)
-	}
-}
-
-func (c *wsClient) handle(ctx context.Context, env Envelope) {
-	switch env.Type {
-	case "auth.hello":
-		c.handleAuth(env)
-	case "workspace.list":
-		_ = c.write("workspace.list.result", env.ID, map[string]any{"workspaces": c.server.workspaces.List()})
-	case "session.list":
-		_ = c.write("session.list.result", env.ID, map[string]any{"sessions": c.server.sessions.List()})
-	case "context.get":
-		c.handleContext(env)
-	case "session.events":
-		c.handleSessionEvents(env)
-	case "device.list":
-		_ = c.write("device.list.result", env.ID, map[string]any{"devices": c.server.devices.Devices()})
-	case "device.revoke":
-		c.handleDeviceRevoke(env)
-	case "session.start", "session.prompt":
-		c.handleSessionStart(ctx, env)
-	case "session.interrupt":
-		c.handleInterrupt(env)
-	case "git.status":
-		c.handleGitStatus(ctx, env, false)
-	case "git.diff":
-		c.handleGitStatus(ctx, env, true)
-	case "git.commit":
-		c.handleGitCommit(ctx, env)
-	case "git.push":
-		c.handleGitPush(ctx, env)
-	case "git.undo":
-		c.handleGitUndo(ctx, env)
-	default:
-		_ = c.writeError(env.ID, "unknown_type", "unsupported message type: "+env.Type)
-	}
-}
-
-type authPayload struct {
-	DeviceID   string `json:"deviceId"`
-	DeviceName string `json:"deviceName"`
-	DeviceKey  string `json:"deviceKey"`
-	Token      string `json:"token"`
-}
-
-func (c *wsClient) handleAuth(env Envelope) {
-	var payload authPayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if c.server.devices.Verify(payload.DeviceID, payload.DeviceKey) {
-		c.authed = true
-		_ = c.write("auth.ok", env.ID, map[string]any{"deviceId": payload.DeviceID, "paired": false})
-		return
-	}
-	if c.server.cfg.Security.PairingEnabled && c.server.PairingToken() != "" && payload.Token == c.server.PairingToken() {
-		device, err := c.server.devices.Pair(payload.DeviceID, payload.DeviceName)
-		if err != nil {
-			_ = c.writeError(env.ID, "pair_failed", err.Error())
-			return
-		}
-		c.authed = true
-		_ = c.write("auth.ok", env.ID, map[string]any{
-			"deviceId":  device.ID,
-			"deviceKey": device.Key,
-			"paired":    true,
-		})
-		return
-	}
-	_ = c.writeError(env.ID, "auth_failed", "device is not authorized")
-}
-
-type deviceRevokePayload struct {
-	DeviceID string `json:"deviceId"`
-}
-
-func (c *wsClient) handleDeviceRevoke(env Envelope) {
-	var payload deviceRevokePayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if err := c.server.devices.Revoke(payload.DeviceID); err != nil {
-		_ = c.writeError(env.ID, "device_revoke_failed", err.Error())
-		return
-	}
-	_ = c.write("device.revoke.result", env.ID, map[string]any{"deviceId": payload.DeviceID})
-}
-
-type workspacePayload struct {
-	Workspace string `json:"workspace"`
-}
-
-type sessionStartPayload struct {
-	Workspace       string `json:"workspace"`
-	Prompt          string `json:"prompt"`
-	Model           string `json:"model"`
-	ReasoningEffort string `json:"reasoningEffort"`
-}
-
-func (c *wsClient) handleContext(env Envelope) {
-	var payload workspacePayload
-	_ = json.Unmarshal(env.Payload, &payload)
-	branch := ""
-	if payload.Workspace != "" {
-		if ws, err := c.server.workspaces.Resolve(payload.Workspace); err == nil {
-			branch = ws.Path
-		}
-	}
-	_ = c.write("context.result", env.ID, c.server.contextPayload(branch))
-}
-
-func (c *wsClient) handleSessionStart(ctx context.Context, env Envelope) {
-	var payload sessionStartPayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	ws, err := c.server.workspaces.Resolve(payload.Workspace)
-	if err != nil {
-		_ = c.writeError(env.ID, "workspace_denied", err.Error())
-		return
-	}
-	record, events, err := c.server.sessions.Start(ctx, codex.StartRequest{
-		Workspace:       ws.Path,
-		Prompt:          payload.Prompt,
-		Model:           payload.Model,
-		ReasoningEffort: payload.ReasoningEffort,
-	})
-	if err != nil {
-		_ = c.writeError(env.ID, "session_start_failed", err.Error())
-		return
-	}
-	_ = c.write("session.created", env.ID, record)
-	go func() {
-		for event := range events {
-			msgType := "session.event"
-			if event.Kind == "done" {
-				msgType = "session.done"
-			}
-			if event.Kind == "error" {
-				msgType = "session.error"
-			}
-			_ = c.write(msgType, "", event)
-		}
-	}()
-}
-
-type interruptPayload struct {
-	SessionID string `json:"sessionId"`
-}
-
-type sessionEventsPayload struct {
-	SessionID string `json:"sessionId"`
-}
-
-func (c *wsClient) handleSessionEvents(env Envelope) {
-	var payload sessionEventsPayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	events, err := c.server.sessions.Events(payload.SessionID)
-	if err != nil {
-		_ = c.writeError(env.ID, "session_events_failed", err.Error())
-		return
-	}
-	_ = c.write("session.events.result", env.ID, map[string]any{
-		"sessionId": payload.SessionID,
-		"events":    events,
-	})
-}
-
-func (c *wsClient) handleInterrupt(env Envelope) {
-	var payload interruptPayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if err := c.server.sessions.Interrupt(payload.SessionID); err != nil {
-		_ = c.writeError(env.ID, "interrupt_failed", err.Error())
-		return
-	}
-	_ = c.write("session.interrupted", env.ID, map[string]any{"sessionId": payload.SessionID})
-}
-
-func (c *wsClient) handleGitStatus(ctx context.Context, env Envelope, includeDiff bool) {
-	var payload workspacePayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	ws, err := c.server.workspaces.Resolve(payload.Workspace)
-	if err != nil {
-		_ = c.writeError(env.ID, "workspace_denied", err.Error())
-		return
-	}
-	result, err := gitops.Snapshot(ctx, ws.Path, includeDiff)
-	if err != nil {
-		_ = c.writeError(env.ID, "git_failed", err.Error())
-		return
-	}
-	msgType := "git.status.result"
-	if includeDiff {
-		msgType = "git.diff.result"
-	}
-	_ = c.write(msgType, env.ID, result)
-}
-
-type gitWritePayload struct {
-	Workspace string `json:"workspace"`
-	Message   string `json:"message"`
-	Confirm   bool   `json:"confirm"`
-}
-
-func (c *wsClient) handleGitCommit(ctx context.Context, env Envelope) {
-	var payload gitWritePayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if c.server.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
-		_ = c.write("confirm.required", env.ID, map[string]any{"action": "git.commit", "message": "Commit requires confirmation."})
-		return
-	}
-	ws, err := c.server.workspaces.Resolve(payload.Workspace)
-	if err != nil {
-		_ = c.writeError(env.ID, "workspace_denied", err.Error())
-		return
-	}
-	output, err := gitops.Commit(ctx, ws.Path, payload.Message)
-	if err != nil {
-		_ = c.writeError(env.ID, "git_commit_failed", err.Error()+"\n"+output)
-		return
-	}
-	_ = c.write("git.commit.result", env.ID, map[string]any{"output": output})
-}
-
-func (c *wsClient) handleGitPush(ctx context.Context, env Envelope) {
-	var payload gitWritePayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if c.server.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
-		_ = c.write("confirm.required", env.ID, map[string]any{"action": "git.push", "message": "Push requires confirmation."})
-		return
-	}
-	ws, err := c.server.workspaces.Resolve(payload.Workspace)
-	if err != nil {
-		_ = c.writeError(env.ID, "workspace_denied", err.Error())
-		return
-	}
-	output, err := gitops.Push(ctx, ws.Path)
-	if err != nil {
-		_ = c.writeError(env.ID, "git_push_failed", err.Error()+"\n"+output)
-		return
-	}
-	_ = c.write("git.push.result", env.ID, map[string]any{"output": output})
-}
-
-func (c *wsClient) handleGitUndo(ctx context.Context, env Envelope) {
-	var payload gitWritePayload
-	if err := decode(env.Payload, &payload); err != nil {
-		_ = c.writeError(env.ID, "bad_payload", err.Error())
-		return
-	}
-	if c.server.cfg.Security.RequireConfirmForGitWrite && !payload.Confirm {
-		_ = c.write("confirm.required", env.ID, map[string]any{"action": "git.undo", "message": "Undo changes requires confirmation."})
-		return
-	}
-	ws, err := c.server.workspaces.Resolve(payload.Workspace)
-	if err != nil {
-		_ = c.writeError(env.ID, "workspace_denied", err.Error())
-		return
-	}
-	output, err := gitops.Undo(ctx, ws.Path)
-	if err != nil {
-		_ = c.writeError(env.ID, "git_undo_failed", err.Error()+"\n"+output)
-		return
-	}
-	_ = c.write("git.undo.result", env.ID, map[string]any{"output": output})
-}
-
-func (c *wsClient) write(msgType, id string, payload any) error {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.WriteJSON(Envelope{Type: msgType, ID: id, Payload: raw})
-}
-
-func (c *wsClient) writeError(id, code, message string) error {
-	return c.write("session.error", id, map[string]any{"code": code, "message": message})
-}
-
-func decode(raw json.RawMessage, target any) error {
-	if len(raw) == 0 {
-		return errors.New("payload is required")
-	}
-	return json.Unmarshal(raw, target)
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func localIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ""
-	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() {
-			continue
-		}
-		if ip := ipNet.IP.To4(); ip != nil {
-			return ip.String()
-		}
-	}
-	return ""
 }

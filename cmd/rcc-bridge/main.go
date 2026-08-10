@@ -1,44 +1,14 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"log"
-	"net/http"
-	"time"
+	"os"
 
-	"recodex-go/internal/api"
-	"recodex-go/internal/config"
-	"recodex-go/internal/serverlog"
+	"recodex-go/internal/bridgeapp"
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "path to bridge YAML config")
-	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-
-	server, err := api.NewServer(cfg)
-	if err != nil {
-		log.Fatalf("create server: %v", err)
-	}
-	if err := server.RunRelayClient(context.Background()); err != nil {
-		log.Fatalf("start relay client: %v", err)
-	}
-
-	addr := cfg.Server.Address()
-	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           server.Routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	log.Printf("Recodex Bridge 已启动: http://%s", addr)
-	serverlog.BridgeStartup(addr, server.PairingToken())
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("serve: %v", err)
+	if err := bridgeapp.Run(os.Args[1:]); err != nil {
+		log.Fatal(err)
 	}
 }

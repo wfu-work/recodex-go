@@ -18,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"recodex-go/internal/config"
+	"recodex-go/internal/version"
 )
 
 type Handler func(context.Context, *websocket.Conn)
@@ -142,7 +143,7 @@ func clientPlatform() string {
 }
 
 func clientVersion() string {
-	return "recodex-go/0.1.0"
+	return "recodex-go/" + version.Value
 }
 
 func Sign(secret, clientID, clientType, roomID, timestamp, nonce string) string {

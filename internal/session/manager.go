@@ -1,12 +1,10 @@
 package session
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +14,8 @@ import (
 
 	"recodex-go/internal/auth"
 	"recodex-go/internal/codex"
+	"recodex-go/internal/config"
+	"recodex-go/internal/statefile"
 )
 
 const (
@@ -33,13 +33,14 @@ const (
 )
 
 type Record struct {
-	ID        string    `json:"id"`
-	Workspace string    `json:"workspace"`
-	Prompt    string    `json:"prompt"`
-	Status    Status    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	Error     string    `json:"error,omitempty"`
+	ID            string    `json:"id"`
+	CodexThreadID string    `json:"codexThreadId,omitempty"`
+	Workspace     string    `json:"workspace"`
+	Prompt        string    `json:"prompt"`
+	Status        Status    `json:"status"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	Error         string    `json:"error,omitempty"`
 }
 
 type UsageSummary struct {
@@ -54,9 +55,13 @@ type UsageSummary struct {
 
 type Manager struct {
 	mu           sync.Mutex
+	root         context.Context
 	path         string
 	eventsDir    string
+	historyPath  string
 	codexHistory map[string]codexHistorySession
+	historyIndex map[string]historyIndexEntry
+	allowed      map[string]struct{}
 	adapter      codex.Adapter
 	records      map[string]Record
 	running      map[string]context.CancelFunc
@@ -72,7 +77,10 @@ type codexHistorySession struct {
 	UpdatedAt time.Time
 }
 
-func NewManager(stateDir string, adapter codex.Adapter) (*Manager, error) {
+func NewManager(root context.Context, stateDir string, adapter codex.Adapter, workspaces []config.WorkspaceConfig) (*Manager, error) {
+	if root == nil {
+		root = context.Background()
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -81,9 +89,13 @@ func NewManager(stateDir string, adapter codex.Adapter) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
+		root:         root,
 		path:         filepath.Join(stateDir, "sessions.json"),
 		eventsDir:    eventsDir,
+		historyPath:  filepath.Join(stateDir, "codex_history_index.json"),
 		codexHistory: map[string]codexHistorySession{},
+		historyIndex: map[string]historyIndexEntry{},
+		allowed:      workspaceSet(workspaces),
 		adapter:      adapter,
 		records:      map[string]Record{},
 		running:      map[string]context.CancelFunc{},
@@ -91,19 +103,51 @@ func NewManager(stateDir string, adapter codex.Adapter) (*Manager, error) {
 	if err := m.load(); err != nil {
 		return nil, err
 	}
-	_ = m.loadCodexHistory()
+	if err := m.reconcileRunningRecords(); err != nil {
+		return nil, err
+	}
+	if err := m.loadHistoryIndex(); err != nil {
+		return nil, err
+	}
+	if err := m.loadCodexHistory(); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
 func (m *Manager) List() []Record {
+	page, _ := m.ListPage(100, 0)
+	return page
+}
+
+func (m *Manager) ListPage(limit, offset int) ([]Record, int) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.loadCodexHistoryLocked()
+	if err := m.loadCodexHistoryLocked(); err != nil {
+		log.Printf("refresh Codex history: %v", err)
+	}
 	out := make([]Record, 0, len(m.records))
+	managedThreads := make(map[string]struct{}, len(m.records))
 	for _, record := range m.records {
+		if record.CodexThreadID != "" {
+			managedThreads[record.CodexThreadID] = struct{}{}
+		}
+		record.Prompt = summarizePrompt(record.Prompt)
 		out = append(out, record)
 	}
 	for _, item := range m.codexHistory {
+		if _, managed := managedThreads[item.ID]; managed {
+			continue
+		}
 		out = append(out, Record{
 			ID:        codexHistoryIDPrefix + item.ID,
 			Workspace: item.Workspace,
@@ -116,36 +160,48 @@ func (m *Manager) List() []Record {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
 	})
-	return out
+	if offset >= len(out) {
+		return nil, 0
+	}
+	end := offset + limit
+	if end >= len(out) {
+		return append([]Record(nil), out[offset:]...), 0
+	}
+	return append([]Record(nil), out[offset:end]...), end
 }
 
 func (m *Manager) Events(id string) ([]codex.Event, error) {
+	return m.EventsPage(id, 1000)
+}
+
+func (m *Manager) EventsPage(id string, limit int) ([]codex.Event, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if strings.HasPrefix(id, codexHistoryIDPrefix) {
-		_ = m.loadCodexHistoryLocked()
+		if err := m.loadCodexHistoryLocked(); err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
 		historyID := strings.TrimPrefix(id, codexHistoryIDPrefix)
 		item, ok := m.codexHistory[historyID]
 		if !ok {
+			m.mu.Unlock()
 			return nil, errors.New("session not found")
 		}
-		return readCodexHistoryEvents(item, historyID)
+		m.mu.Unlock()
+		return readCodexHistoryEvents(item, historyID, limit)
 	}
 	if _, ok := m.records[id]; !ok {
+		m.mu.Unlock()
 		return nil, errors.New("session not found")
 	}
-	raw, err := os.ReadFile(m.eventsPath(id))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var events []codex.Event
-	if err := json.Unmarshal(raw, &events); err != nil {
-		return nil, err
-	}
-	return events, nil
+	m.mu.Unlock()
+	return m.readEventsPage(id, limit)
 }
 
 func (m *Manager) UsageSummary(ratePer1KTokens float64) UsageSummary {
@@ -164,15 +220,11 @@ func (m *Manager) UsageSummary(ratePer1KTokens float64) UsageSummary {
 		return summary
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") && !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(m.eventsDir, entry.Name()))
+		events, err := readEventFile(filepath.Join(m.eventsDir, entry.Name()), 0)
 		if err != nil {
-			continue
-		}
-		var events []codex.Event
-		if err := json.Unmarshal(raw, &events); err != nil {
 			continue
 		}
 		for _, event := range events {
@@ -208,7 +260,16 @@ func (m *Manager) Start(parent context.Context, req codex.StartRequest) (Record,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	ctx, cancel := context.WithCancel(parent)
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return Record{}, nil, err
+	}
+	if err := m.root.Err(); err != nil {
+		return Record{}, nil, err
+	}
+	ctx, cancel := context.WithCancel(m.root)
 
 	req.SessionID = record.ID
 	events, err := m.adapter.Run(ctx, req)
@@ -220,16 +281,24 @@ func (m *Manager) Start(parent context.Context, req codex.StartRequest) (Record,
 	m.mu.Lock()
 	m.records[record.ID] = record
 	m.running[record.ID] = cancel
-	_ = m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		delete(m.records, record.ID)
+		delete(m.running, record.ID)
+		m.mu.Unlock()
+		cancel()
+		return Record{}, nil, err
+	}
 	m.mu.Unlock()
 
-	wrapped := make(chan codex.Event, 64)
+	wrapped := make(chan codex.Event, 256)
 	go func() {
 		defer close(wrapped)
 		for event := range events {
-			m.appendEvent(record.ID, event)
+			if err := m.appendEvent(record.ID, event); err != nil {
+				log.Printf("persist session %s event: %v", record.ID, err)
+			}
 			m.applyEvent(record.ID, event)
-			wrapped <- event
+			offerEvent(wrapped, event)
 		}
 	}()
 
@@ -249,31 +318,63 @@ func (m *Manager) Interrupt(id string) error {
 }
 
 func (m *Manager) applyEvent(id string, event codex.Event) {
+	if event.ThreadID != "" {
+		m.attachCodexThreadID(id, event.ThreadID)
+	}
+	if !event.Terminal {
+		return
+	}
 	switch event.Kind {
 	case "done":
 		m.update(id, StatusDone, "")
 	case "interrupted":
-		m.update(id, StatusInterrupted, "")
+		m.update(id, StatusInterrupted, event.Text)
 	case "error":
 		m.update(id, StatusError, event.Text)
 	}
 }
 
-func (m *Manager) update(id string, status Status, message string) {
+func (m *Manager) attachCodexThreadID(id, threadID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	record, ok := m.records[id]
+	if !ok || record.CodexThreadID == threadID {
+		return
+	}
+	record.CodexThreadID = threadID
+	m.records[id] = record
+	if err := m.saveLocked(); err != nil {
+		log.Printf("persist session %s Codex thread ID: %v", id, err)
+	}
+}
+
+func (m *Manager) update(id string, status Status, message string) {
+	m.mu.Lock()
+	record, ok := m.records[id]
 	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if record.Status != StatusRunning && record.Status != status {
+		m.mu.Unlock()
 		return
 	}
 	record.Status = status
 	record.UpdatedAt = time.Now()
 	record.Error = message
 	m.records[id] = record
+	var cancel context.CancelFunc
 	if status != StatusRunning {
+		cancel = m.running[id]
 		delete(m.running, id)
 	}
-	_ = m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		log.Printf("persist session %s status: %v", id, err)
+	}
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (m *Manager) load() error {
@@ -284,7 +385,13 @@ func (m *Manager) load() error {
 		}
 		return err
 	}
-	return json.Unmarshal(raw, &m.records)
+	if err := json.Unmarshal(raw, &m.records); err != nil {
+		return err
+	}
+	if m.records == nil {
+		m.records = map[string]Record{}
+	}
+	return nil
 }
 
 func (m *Manager) saveLocked() error {
@@ -292,29 +399,28 @@ func (m *Manager) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.path, raw, 0o600)
+	return statefile.WriteFile(m.path, raw, 0o600)
 }
 
-func (m *Manager) appendEvent(id string, event codex.Event) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var events []codex.Event
-	path := m.eventsPath(id)
-	raw, err := os.ReadFile(path)
-	if err == nil {
-		_ = json.Unmarshal(raw, &events)
-	}
-	if len(events) > 0 && isLiveStatusEvent(event) && isLiveStatusEvent(events[len(events)-1]) {
-		events[len(events)-1] = event
-	} else {
-		events = append(events, event)
-	}
-	next, err := json.MarshalIndent(events, "", "  ")
+func (m *Manager) appendEvent(id string, event codex.Event) error {
+	raw, err := json.Marshal(event)
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, next, 0o600)
+	raw = append(raw, '\n')
+	file, err := os.OpenFile(m.eventsPath(id), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	written, writeErr := file.Write(raw)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if written != len(raw) {
+		return errors.New("short session event write")
+	}
+	return closeErr
 }
 
 func isLiveStatusEvent(event codex.Event) bool {
@@ -322,322 +428,71 @@ func isLiveStatusEvent(event codex.Event) bool {
 }
 
 func (m *Manager) eventsPath(id string) string {
+	return filepath.Join(m.eventsDir, id+".jsonl")
+}
+
+func (m *Manager) legacyEventsPath(id string) string {
 	return filepath.Join(m.eventsDir, id+".json")
 }
 
-func (m *Manager) loadCodexHistory() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.loadCodexHistoryLocked()
-}
-
-func (m *Manager) loadCodexHistoryLocked() error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-	root := filepath.Join(home, ".codex", "sessions")
-	next := map[string]codexHistorySession{}
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
-		item, err := readCodexHistorySummary(path)
-		if err != nil || item.ID == "" || item.Workspace == "" {
-			return nil
-		}
-		next[item.ID] = item
-		return nil
-	})
-	if err == nil {
-		m.codexHistory = next
-	}
-	return err
-}
-
-type codexHistoryLine struct {
-	Timestamp string          `json:"timestamp"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
-}
-
-type codexHistoryMetaPayload struct {
-	ID        string `json:"id"`
-	CWD       string `json:"cwd"`
-	Timestamp string `json:"timestamp"`
-}
-
-type codexHistoryEventPayload struct {
-	Type    string                           `json:"type"`
-	Message string                           `json:"message"`
-	Images  []string                         `json:"images"`
-	Changes map[string]codexHistoryPatchFile `json:"changes"`
-}
-
-type codexHistoryPatchFile struct {
-	Type        string  `json:"type"`
-	UnifiedDiff string  `json:"unified_diff"`
-	MovePath    *string `json:"move_path"`
-}
-
-func readCodexHistorySummary(path string) (codexHistorySession, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return codexHistorySession{}, err
-	}
-	defer file.Close()
-
-	item := codexHistorySession{Path: path}
-	completed := false
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		var line codexHistoryLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			continue
-		}
-		if ts := parseCodexTime(line.Timestamp); !ts.IsZero() {
-			if item.CreatedAt.IsZero() {
-				item.CreatedAt = ts
-			}
-			item.UpdatedAt = ts
-		}
-		switch line.Type {
-		case "session_meta":
-			var payload codexHistoryMetaPayload
-			if err := json.Unmarshal(line.Payload, &payload); err == nil {
-				item.ID = payload.ID
-				item.Workspace = filepath.Clean(payload.CWD)
-				if ts := parseCodexTime(payload.Timestamp); !ts.IsZero() && item.CreatedAt.IsZero() {
-					item.CreatedAt = ts
-				}
-			}
-		case "event_msg":
-			var payload codexHistoryEventPayload
-			if err := json.Unmarshal(line.Payload, &payload); err == nil {
-				if payload.Type == "user_message" {
-					completed = false
-					item.Prompt = cleanUserPrompt(payload.Message)
-				}
-				if payload.Type == "task_complete" {
-					completed = true
-				}
-			}
-		}
-	}
-	if item.UpdatedAt.IsZero() {
-		item.UpdatedAt = item.CreatedAt
-	}
-	item.Status = StatusDone
-	if !completed && time.Since(item.UpdatedAt) <= codexHistoryLiveTTL {
-		item.Status = StatusRunning
-	}
-	return item, scanner.Err()
-}
-
-func readCodexHistoryEvents(item codexHistorySession, sessionID string) ([]codex.Event, error) {
-	file, err := os.Open(item.Path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var events []codex.Event
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		var line codexHistoryLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil || line.Type != "event_msg" {
-			continue
-		}
-		var payload codexHistoryEventPayload
-		if err := json.Unmarshal(line.Payload, &payload); err != nil {
-			continue
-		}
-		if payload.Type == "patch_apply_end" {
-			if text := codexHistoryPatchNumstat(payload); text != "" {
-				event := codex.Event{
-					SessionID: codexHistoryIDPrefix + sessionID,
-					Kind:      "git_change",
-					Text:      text,
-					Time:      parseCodexTime(line.Timestamp),
-				}
-				if len(events) > 0 && events[len(events)-1].Kind == event.Kind {
-					events[len(events)-1].Text += "\n" + event.Text
-				} else {
-					events = append(events, event)
-				}
-			}
-			continue
-		}
-		if payload.Type == "task_complete" {
-			events = append(events, codex.Event{
-				SessionID: codexHistoryIDPrefix + sessionID,
-				Kind:      "done",
-				Time:      parseCodexTime(line.Timestamp),
-			})
-			continue
-		}
-		if payload.Message == "" && len(payload.Images) == 0 {
-			continue
-		}
-		kind := ""
-		switch payload.Type {
-		case "user_message":
-			kind = "user"
-		case "agent_message":
-			kind = "assistant"
-		default:
-			continue
-		}
-		events = append(events, codex.Event{
-			SessionID:   codexHistoryIDPrefix + sessionID,
-			Kind:        kind,
-			Text:        cleanUserPrompt(payload.Message),
-			Time:        parseCodexTime(line.Timestamp),
-			Attachments: codexHistoryImageAttachments(payload.Images),
-		})
-	}
-	if item.Status == StatusRunning {
-		events = trimTerminalEventsAfterLastUser(events)
-		events = appendLiveCodexHistoryEvent(events, sessionID, item.UpdatedAt)
-	}
-	return events, scanner.Err()
-}
-
-func trimTerminalEventsAfterLastUser(events []codex.Event) []codex.Event {
-	lastUserIndex := -1
-	for index, event := range events {
-		if event.Kind == "user" {
-			lastUserIndex = index
-		}
-	}
-	if lastUserIndex < 0 {
-		return events
-	}
-	trimmed := events[:0]
-	for index, event := range events {
-		if index > lastUserIndex && isTerminalHistoryEvent(event) {
-			continue
-		}
-		trimmed = append(trimmed, event)
-	}
-	return trimmed
-}
-
-func isTerminalHistoryEvent(event codex.Event) bool {
-	switch event.Kind {
-	case "done", "interrupted", "error":
-		return true
+func offerEvent(events chan codex.Event, event codex.Event) {
+	select {
+	case events <- event:
+		return
 	default:
-		return false
+	}
+	// Persistence is authoritative. When a client falls behind, discard one
+	// stale live event instead of blocking Codex stdout indefinitely.
+	select {
+	case <-events:
+	default:
+	}
+	select {
+	case events <- event:
+	default:
 	}
 }
 
-func codexHistoryImageAttachments(images []string) []codex.Attachment {
-	if len(images) == 0 {
-		return nil
+func (m *Manager) Close() {
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.running))
+	now := time.Now()
+	for id, cancel := range m.running {
+		cancels = append(cancels, cancel)
+		record := m.records[id]
+		if record.Status == StatusRunning {
+			record.Status = StatusInterrupted
+			record.Error = "bridge is shutting down"
+			record.UpdatedAt = now
+			m.records[id] = record
+		}
 	}
-	attachments := make([]codex.Attachment, 0, len(images))
-	for _, image := range images {
-		image = strings.TrimSpace(image)
-		if image == "" {
+	clear(m.running)
+	if len(cancels) > 0 {
+		if err := m.saveLocked(); err != nil {
+			log.Printf("persist sessions during shutdown: %v", err)
+		}
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (m *Manager) reconcileRunningRecords() error {
+	changed := false
+	for id, record := range m.records {
+		if record.Status != StatusRunning {
 			continue
 		}
-		attachments = append(attachments, codex.Attachment{
-			Type:    "image",
-			Mime:    dataURLMime(image),
-			DataURL: image,
-		})
+		record.Status = StatusInterrupted
+		record.Error = "bridge restarted while session was running"
+		record.UpdatedAt = time.Now()
+		m.records[id] = record
+		changed = true
 	}
-	return attachments
-}
-
-func dataURLMime(value string) string {
-	if !strings.HasPrefix(value, "data:") {
-		return ""
+	if changed {
+		return m.saveLocked()
 	}
-	meta, _, ok := strings.Cut(value, ",")
-	if !ok {
-		return ""
-	}
-	mime := strings.TrimPrefix(meta, "data:")
-	mime, _, _ = strings.Cut(mime, ";")
-	return mime
-}
-
-func codexHistoryPatchNumstat(payload codexHistoryEventPayload) string {
-	if len(payload.Changes) == 0 {
-		return ""
-	}
-	lines := make([]string, 0, len(payload.Changes))
-	for path, change := range payload.Changes {
-		displayPath := path
-		if change.MovePath != nil && strings.TrimSpace(*change.MovePath) != "" {
-			displayPath = strings.TrimSpace(*change.MovePath)
-		}
-		added, removed := countUnifiedDiffDelta(change.UnifiedDiff)
-		if change.Type == "delete" && added == 0 && removed == 0 {
-			removed = 1
-		}
-		if strings.TrimSpace(displayPath) == "" || added == 0 && removed == 0 {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("%d\t%d\t%s", added, removed, displayPath))
-	}
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
-}
-
-func countUnifiedDiffDelta(diff string) (int, int) {
-	added := 0
-	removed := 0
-	for _, line := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
-			continue
-		case strings.HasPrefix(line, "+"):
-			added++
-		case strings.HasPrefix(line, "-"):
-			removed++
-		}
-	}
-	return added, removed
-}
-
-func appendLiveCodexHistoryEvent(events []codex.Event, sessionID string, at time.Time) []codex.Event {
-	if len(events) > 0 && isLiveStatusEvent(events[len(events)-1]) {
-		events[len(events)-1] = codex.Event{
-			SessionID: codexHistoryIDPrefix + sessionID,
-			Kind:      "running",
-			Text:      "正在同步电脑端 Codex 执行...",
-			Time:      at,
-		}
-		return events
-	}
-	return append(events, codex.Event{
-		SessionID: codexHistoryIDPrefix + sessionID,
-		Kind:      "running",
-		Text:      "正在同步电脑端 Codex 执行...",
-		Time:      at,
-	})
-}
-
-func cleanUserPrompt(value string) string {
-	const marker = "## My request for Codex:"
-	if idx := strings.Index(value, marker); idx >= 0 {
-		return strings.TrimSpace(value[idx+len(marker):])
-	}
-	return strings.TrimSpace(value)
-}
-
-func parseCodexTime(value string) time.Time {
-	if value == "" {
-		return time.Time{}
-	}
-	ts, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}
-	}
-	return ts
+	return nil
 }

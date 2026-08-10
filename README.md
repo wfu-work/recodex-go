@@ -44,7 +44,7 @@ docs/
 go run . -config config.yaml
 ```
 
-默认 Bridge 地址为 `http://127.0.0.1:8765`。如果配置了 `relay.enabled: true`，Bridge 还会主动连接远程 Relay 房间。启动后，日志会打印 Bridge 的配对 Token。客户端可以手动输入该 Token，也可以请求 `/pairing` 获取 `recodex://pair` URI 后生成二维码。
+默认 Bridge 地址为 `http://127.0.0.1:8765`，API 基地址为 `http://127.0.0.1:8765/api`。如果配置了 `relay.enabled: true`，Bridge 还会主动连接远程 Relay 房间。启动后，日志会打印 Bridge 的配对 Token。本机 Web 控制台可以请求 `/api/pairing` 生成 `recodex://pair` 二维码；远程设备不能直接读取配对 Token。
 
 ## 单独运行 Bridge
 
@@ -62,21 +62,23 @@ http://127.0.0.1:8765
 
 常用接口：
 
-- `GET /healthz`
-- `GET /version`
-- `GET /pairing`
-- `GET /relay`
-- `GET /context`
-- `GET /workspaces`
-- `GET /devices`
-- `GET /sessions`
-- `GET /sessions/{id}/events`
-- `GET /git/status?workspace=<path-or-name>`
-- `GET /git/diff?workspace=<path-or-name>`
-- `POST /git/commit`
-- `POST /git/push`
-- `POST /git/undo`
-- `WS /ws`
+- `GET /api/healthz`
+- `GET /api/version`
+- `GET /api/pairing`
+- `GET /api/relay`
+- `GET /api/context`
+- `GET /api/workspaces`
+- `GET /api/devices`
+- `GET /api/sessions?limit=100&offset=0`
+- `GET /api/sessions/{id}/events?limit=1000`
+- `GET /api/git/status?workspace=<path-or-name>`
+- `GET /api/git/diff?workspace=<path-or-name>`
+- `POST /api/git/commit`
+- `POST /api/git/push`
+- `POST /api/git/undo`
+- `WS /api/ws`
+
+除健康检查、版本和 WebSocket 外，HTTP 控制接口只接受本机回环连接。手机或远程客户端应通过完成设备认证的 WebSocket 或 Relay 使用业务能力。
 
 ## 配置
 
@@ -130,7 +132,7 @@ relay:
   client_type: "bridge"
 ```
 
-`url` 是 Bridge 自己拨号使用的地址，`public_url` 是 `/pairing` 和 `/relay` 返回给客户端看的地址。远程第三方 Relay 通常两者一样；如果 Bridge 走内网地址、App 走公网反代地址，就把 `public_url` 设置成公网 `wss://` 地址。
+`url` 是 Bridge 自己拨号使用的地址，`public_url` 是 `/api/pairing` 和 `/api/relay` 返回给客户端看的地址。远程第三方 Relay 通常两者一样；如果 Bridge 走内网地址、App 走公网反代地址，就把 `public_url` 设置成公网 `wss://` 地址。
 
 如果需要补充 Codex 未记录的目录，也可以手动添加 `workspaces`：
 
@@ -157,7 +159,7 @@ http://192.168.1.20:8765
 ## 配对流程
 
 1. 启动 `rcc-bridge`。
-2. 查看控制台输出的 pairing token，或访问 `GET /pairing`。
+2. 在开发机查看控制台输出的 pairing token，或通过本机 Web 控制台访问 `GET /api/pairing`。
 3. 客户端通过 `auth.hello` 发送设备信息和配对 Token。
 4. Bridge 返回 `deviceKey`，客户端保存该 Key。
 5. 后续连接使用 `deviceId` 和 `deviceKey` 认证，不再需要配对 Token。
@@ -176,7 +178,7 @@ http://192.168.1.20:8765
 }
 ```
 
-客户端连接 `ws://<host>:8765/ws` 后，第一条消息必须是 `auth.hello`。
+客户端连接 `ws://<host>:8765/api/ws` 后，第一条消息必须是 `auth.hello`。
 
 已支持的客户端消息：
 
@@ -217,10 +219,13 @@ relay:
 - Bridge 默认只监听 `127.0.0.1`。
 - 工作区默认来自 Codex 已记录项目，也可以通过 `config.yaml` 追加。
 - 配对 Token 短期有效。
+- 配对 Token 单次使用，成功配对后立即轮换。
 - 已配对设备的长期 Key 保存在状态目录中。
 - 已认证客户端可以列出和撤销设备。
 - Git 写操作默认需要 `confirm: true`。
 - 命令执行使用 `exec.CommandContext` 和参数数组，不拼接 Shell 字符串。
+- Codex Prompt 通过 stdin 传递，不会被解析为 CLI 参数或暴露在进程参数中。
+- 会话摘要使用增量索引和分页；事件使用追加式 JSONL 持久化，并兼容旧 JSON 文件。
 - 远程 Relay 只应转发不透明载荷，业务认证仍由 Bridge/App 完成。
 
 更多说明见 [docs/security.md](docs/security.md)。

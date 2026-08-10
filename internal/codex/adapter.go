@@ -52,12 +52,14 @@ type StartRequest struct {
 
 type Event struct {
 	SessionID   string       `json:"sessionId"`
+	ThreadID    string       `json:"threadId,omitempty"`
 	Kind        string       `json:"kind"`
 	Text        string       `json:"text,omitempty"`
 	Raw         string       `json:"raw,omitempty"`
 	Time        time.Time    `json:"time"`
 	Usage       *Usage       `json:"usage,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+	Terminal    bool         `json:"terminal,omitempty"`
 }
 
 type Attachment struct {
@@ -91,25 +93,16 @@ func (a CLIAdapter) Run(ctx context.Context, req StartRequest) (<-chan Event, er
 	if req.Prompt == "" {
 		return nil, errors.New("prompt is required")
 	}
+	if len(req.Prompt) > 256*1024 {
+		return nil, errors.New("prompt exceeds 256 KiB limit")
+	}
 
-	args := []string{"exec", "--json", "--color", "never", "--skip-git-repo-check", "--cd", req.Workspace}
-	model := req.Model
-	if model == "" {
-		model = a.cfg.Model
+	args, err := a.commandArgs(req)
+	if err != nil {
+		return nil, err
 	}
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	reasoningEffort := req.ReasoningEffort
-	if reasoningEffort == "" {
-		reasoningEffort = a.cfg.ReasoningEffort
-	}
-	if reasoningEffort != "" {
-		args = append(args, "--config", "model_reasoning_effort=\""+reasoningEffort+"\"")
-	}
-	args = append(args, req.Prompt)
-
 	cmd := exec.CommandContext(ctx, a.cfg.Binary, args...)
+	cmd.Stdin = strings.NewReader(req.Prompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -133,24 +126,70 @@ func (a CLIAdapter) Run(ctx context.Context, req StartRequest) (<-chan Event, er
 		err := cmd.Wait()
 		scanners.Wait()
 		if ctx.Err() != nil {
-			events <- Event{SessionID: req.SessionID, Kind: "interrupted", Text: ctx.Err().Error(), Time: time.Now()}
+			events <- Event{SessionID: req.SessionID, Kind: "interrupted", Text: ctx.Err().Error(), Time: time.Now(), Terminal: true}
 			return
 		}
 		if err != nil {
-			events <- Event{SessionID: req.SessionID, Kind: "error", Text: err.Error(), Time: time.Now()}
+			events <- Event{SessionID: req.SessionID, Kind: "error", Text: err.Error(), Time: time.Now(), Terminal: true}
 			return
 		}
-		events <- Event{SessionID: req.SessionID, Kind: "done", Time: time.Now()}
+		events <- Event{SessionID: req.SessionID, Kind: "done", Time: time.Now(), Terminal: true}
 	}()
 
 	return events, nil
+}
+
+func (a CLIAdapter) commandArgs(req StartRequest) ([]string, error) {
+	args := []string{"exec", "--json", "--color", "never", "--skip-git-repo-check", "--cd", req.Workspace}
+	model := req.Model
+	if model == "" {
+		model = a.cfg.Model
+	}
+	if req.Model != "" && len(a.cfg.Models) > 0 && !contains(a.cfg.Models, req.Model) {
+		return nil, fmt.Errorf("unsupported model %q", req.Model)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	reasoningEffort := req.ReasoningEffort
+	if reasoningEffort == "" {
+		reasoningEffort = a.cfg.ReasoningEffort
+	}
+	if !validReasoningEffort(reasoningEffort) {
+		return nil, fmt.Errorf("unsupported reasoning effort %q", reasoningEffort)
+	}
+	if reasoningEffort != "" {
+		args = append(args, "--config", "model_reasoning_effort=\""+reasoningEffort+"\"")
+	}
+	// A literal "-" makes Codex read the prompt from stdin. This keeps user
+	// input out of argv and prevents prompts such as "--help" from becoming
+	// CLI flags or subcommands.
+	return append(args, "-"), nil
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func validReasoningEffort(value string) bool {
+	switch value {
+	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		return true
+	default:
+		return false
+	}
 }
 
 func scanLines(wg *sync.WaitGroup, events chan<- Event, sessionID, kind string, reader io.Reader) {
 	defer wg.Done()
 	scanner := bufio.NewScanner(reader)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, 16*1024*1024)
 	for scanner.Scan() {
 		event, ok := parseLine(sessionID, kind, scanner.Text())
 		if ok {
@@ -158,7 +197,7 @@ func scanLines(wg *sync.WaitGroup, events chan<- Event, sessionID, kind string, 
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		events <- Event{SessionID: sessionID, Kind: "error", Text: err.Error(), Time: time.Now()}
+		events <- Event{SessionID: sessionID, Kind: "stream_error", Text: err.Error(), Time: time.Now()}
 	}
 }
 
@@ -169,6 +208,9 @@ func parseLine(sessionID, fallbackKind, line string) (Event, bool) {
 		return event, true
 	}
 	event.Text = ""
+	if value, ok := data["thread_id"].(string); ok {
+		event.ThreadID = strings.TrimSpace(value)
+	}
 	if value, ok := data["type"].(string); ok && value != "" {
 		event.Kind = value
 	}

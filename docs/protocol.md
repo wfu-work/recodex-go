@@ -12,37 +12,39 @@ All WebSocket messages are JSON envelopes:
 
 ## HTTP
 
-- `GET /healthz`
-- `GET /version`
-- `GET /pairing`
-- `GET /context`
-- `GET /workspaces`
-- `GET /devices`
-- `GET /sessions`
-- `GET /sessions/{id}/events`
-- `GET /git/status?workspace=<path-or-name>`
-- `GET /git/diff?workspace=<path-or-name>`
-- `POST /git/commit`
-- `POST /git/push`
-- `POST /git/undo`
-- `GET /relay`
+- `GET /api/healthz`
+- `GET /api/version`
+- `GET /api/pairing`
+- `GET /api/context`
+- `GET /api/workspaces`
+- `GET /api/devices`
+- `GET /api/sessions?limit=100&offset=0`
+- `GET /api/sessions/{id}/events?limit=1000`
+- `GET /api/git/status?workspace=<path-or-name>`
+- `GET /api/git/diff?workspace=<path-or-name>`
+- `POST /api/git/commit`
+- `POST /api/git/push`
+- `POST /api/git/undo`
+- `GET /api/relay`
 
-These HTTP endpoints are available without WebSocket authentication for the bundled local web console. Git write endpoints still honor `security.require_confirm_for_git_write` and return `confirm.required`-style payloads when confirmation is required.
+These HTTP endpoints support the bundled web console and, except for health and version, only accept loopback requests. Remote devices use authenticated WebSocket messages. Git write endpoints still honor `security.require_confirm_for_git_write`.
 
-`GET /pairing` returns:
+Session lists default to 100 records and return `nextOffset` when another page exists. Session events default to the most recent 1000 records. The list limit is capped at 200 and the event limit at 5000.
+
+`GET /api/pairing` returns:
 
 ```json
 {
-  "baseUrl": "http://127.0.0.1:8765",
+  "baseUrl": "http://127.0.0.1:8765/api",
   "token": "pairing-token",
-  "pairingUri": "recodex://pair?baseUrl=http%3A%2F%2F127.0.0.1%3A8765&token=pairing-token",
+  "pairingUri": "recodex://pair?baseUrl=http%3A%2F%2F127.0.0.1%3A8765%2Fapi&token=pairing-token",
   "lanHost": "192.168.1.20"
 }
 ```
 
 ## WebSocket
 
-Connect to `ws://<host>:8765/ws`.
+Connect to `ws://<host>:8765/api/ws`.
 
 The first client message must be `auth.hello`.
 
@@ -55,12 +57,12 @@ The first client message must be `auth.hello`.
   "payload": {
     "deviceId": "phone_1",
     "deviceName": "iPhone",
-    "token": "<token from /pairing>"
+    "token": "<token from the local /api/pairing endpoint>"
   }
 }
 ```
 
-The bridge returns `auth.ok` with `deviceKey`. The app stores that key and uses it on later connects:
+The bridge returns `auth.ok` with `deviceKey`. The pairing token is single-use, so a successful pairing immediately invalidates it and creates a fresh local token for the next device. The app stores the device key and uses it on later connects:
 
 ```json
 {
